@@ -1,5 +1,5 @@
 // Billing 产品接口（API v1，ADR-0014）的客户端。零依赖，只用 fetch，
-// Node 18+、Bun、Deno、Cloudflare Workers 都能用。
+// Node 20+（需要全局 crypto.subtle）、Bun、Deno、Cloudflare Workers 都能用。
 //
 // 模型：先用后报。开始前读一次余额（allowed 为 false 就不开始）；执行中按固定
 // 间隔上报已发生的用量；响应里 allowed 变成 false 就结束。用 createMeter 即可。
@@ -150,20 +150,23 @@ export function createBillingClient(config: BillingConfig) {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     const text = await response.text();
-    let result: Record<string, unknown>;
+    let parsed: unknown;
     try {
-      result = (text ? JSON.parse(text) : {}) as Record<string, unknown>;
+      parsed = text ? JSON.parse(text) : undefined;
     } catch {
-      // A success with an unreadable body is not a result: never read it as
-      // an empty one (that would turn `allowed` into undefined, i.e. "stop").
-      if (response.ok)
-        throw new BillingError(
-          response.status,
-          "invalid_response",
-          "Billing answered with a body that is not JSON",
-        );
-      result = {};
+      parsed = undefined;
     }
+    const isObject =
+      typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
+    // A success that is not a JSON object is not a result: never read it as an
+    // empty one (that would turn `allowed` into undefined, i.e. "stop").
+    if (response.ok && !isObject)
+      throw new BillingError(
+        response.status,
+        "invalid_response",
+        "Billing answered with a body that is not a JSON object",
+      );
+    const result = (isObject ? parsed : {}) as Record<string, unknown>;
     if (!response.ok)
       throw new BillingError(
         response.status,
@@ -251,10 +254,11 @@ export function createBillingClient(config: BillingConfig) {
       if (options.cursor) query.set("cursor", options.cursor);
       if (options.type) query.set("type", options.type);
       const suffix = query.size ? `?${query}` : "";
-      return call<{ data: HistoryEntry[]; next_cursor: string | null }>(
-        "GET",
-        `${customer(id)}/history${suffix}`,
-      );
+      return call<{
+        data: HistoryEntry[];
+        has_more: boolean;
+        next_cursor: string | null;
+      }>("GET", `${customer(id)}/history${suffix}`);
     },
   };
 }
@@ -269,16 +273,43 @@ export interface MeterOptions {
   intervalMs?: number;
   /** 随每条用量记入流水的字符串键值（≤1 KB），例如是哪个 Agent 在运行 */
   metadata?: Record<string, string>;
-  /** 余额用尽（allowed 为 false）时调用一次，产品在这里结束工作 */
+  /**
+   * 余额用尽（allowed 为 false）或账户已关闭（409 account_closed）时调用一次，
+   * 产品在这里结束工作
+   */
   onStop?: (standing: Standing) => void;
-  /** 上报失败时调用；这一批用量会以同一个事件 ID 在下一轮重试 */
+  /** 上报失败时调用；暂时性失败会重试这一批，永久拒绝会丢弃这一批（见 createMeter） */
   onError?: (error: unknown) => void;
 }
 
 /**
- * 按间隔批量上报用量。add() 累加，定时以递增的事件 ID 上报；网络失败时同一批
- * 用量保持原事件 ID 重试，所以不会重复扣费。进程崩溃最多丢一个间隔的用量
- * （对商户是少收，不是多收）。
+ * Billing 明确拒绝（不是故障）：4xx 且不是 invalid_response。408、429 是
+ * “稍后再试”，仍算暂时性失败。
+ */
+function refused(error: unknown): error is BillingError {
+  return (
+    error instanceof BillingError &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    error.status !== 408 &&
+    error.status !== 429 &&
+    error.code !== "invalid_response"
+  );
+}
+
+/**
+ * 按间隔批量上报用量。add() 累加，定时以递增的事件 ID 上报。进程崩溃最多丢一个
+ * 间隔的用量（对商户是少收，不是多收）。失败分两种：
+ *
+ * - 暂时性（网络错误、超时、5xx、408、429、invalid_response）：调用 onError，
+ *   同一批用量保持原事件 ID 在下一轮重试，所以不会重复扣费。
+ * - 永久拒绝（其余 4xx，如 event_conflict、invalid_metadata、invalid_integer）：
+ *   调用 onError，丢弃这一批（重试也只会再被拒），之后的用量照常上报。
+ *   409 account_closed 例外：账户已关闭、无法再扣费，调用一次 onStop（带最后
+ *   一次已知的余额，没有则为 { balance: "0", allowed: false }），丢弃累计的用量
+ *   并不再上报。
+ *
+ * flush() 和 close() 在两种失败时都会抛出该错误；account_closed 不抛。
  */
 export function createMeter(client: BillingClient, options: MeterOptions) {
   let buffered = 0n;
@@ -289,9 +320,17 @@ export function createMeter(client: BillingClient, options: MeterOptions) {
     metadata?: Record<string, string>;
   } | null = null;
   let stopped = false;
+  let closed = false;
+  let last: Standing = { balance: "0", allowed: false };
   let sending: Promise<void> | null = null;
 
+  const stop = (standing: Standing) => {
+    if (stopped) return;
+    stopped = true;
+    options.onStop?.(standing);
+  };
   const send = async () => {
+    if (closed) return;
     if (!pending && buffered > 0n) {
       pending = {
         event_id: `${options.eventPrefix}:${++sequence}`,
@@ -304,11 +343,18 @@ export function createMeter(client: BillingClient, options: MeterOptions) {
     try {
       const result = await client.reportUsage(options.customer, pending);
       pending = null;
-      if (!result.allowed && !stopped) {
-        stopped = true;
-        options.onStop?.({ balance: result.balance, allowed: result.allowed });
-      }
+      last = { balance: result.balance, allowed: result.allowed };
+      if (!result.allowed) stop(last);
     } catch (error) {
+      if (refused(error) && error.code === "account_closed") {
+        closed = true;
+        clearInterval(timer);
+        pending = null;
+        buffered = 0n;
+        stop(last);
+        return;
+      }
+      if (refused(error)) pending = null;
       options.onError?.(error);
       throw error;
     }
@@ -325,11 +371,11 @@ export function createMeter(client: BillingClient, options: MeterOptions) {
     add(units: number | bigint) {
       const value = BigInt(units);
       if (value < 0n) throw new RangeError("units must not be negative");
-      buffered += value;
+      if (!closed) buffered += value;
     },
     /** 立即上报累计的用量 */
     flush,
-    /** 余额是否已用尽 */
+    /** 余额是否已用尽（或账户已关闭） */
     get stopped() {
       return stopped;
     },
@@ -337,7 +383,7 @@ export function createMeter(client: BillingClient, options: MeterOptions) {
     async close() {
       clearInterval(timer);
       while (sending) await sending.catch(() => {});
-      while (pending || buffered > 0n) await flush();
+      while (!closed && (pending || buffered > 0n)) await flush();
     },
   };
 }

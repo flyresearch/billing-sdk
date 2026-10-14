@@ -4,14 +4,14 @@ Billing 产品接口（API v1）的客户端，以及给产品自己写测试用
 
 模型是**先用后报**：开始工作前读一次余额，执行中按间隔上报已经发生的用量，余额用尽时 Billing 告诉你停下。超支最多一个上报间隔，下一次充值先抵扣。
 
-- `@flyresearch/billing-sdk`：零依赖、只用 `fetch` 的客户端和 `createMeter`。Node 18+、Bun、Deno、Cloudflare Workers 都能用。
+- `@flyresearch/billing-sdk`：零依赖、只用 `fetch` 的客户端和 `createMeter`。Node 20+、Bun、Deno、Cloudflare Workers 都能用（需要全局 `crypto.subtle`，Node 18 要加 `--experimental-global-webcrypto`）。
 - `@flyresearch/billing-sdk/testing`：内存假服务，按公开接口的规则行为。
 - `@flyresearch/billing-sdk/contract`：契约测试。同一套测试在这里对假服务跑，在 Billing 服务仓库里对真服务跑，保证两者一致。
 
 ## 安装
 
 ```sh
-bun add github:flyresearch/billing-sdk#v0.4.2
+bun add github:flyresearch/billing-sdk#v0.4.3
 ```
 
 源码是 TypeScript，直接被 Bun、Deno 和 Workers 的打包器使用。`v0.1.x` 是旧接口（冻结与结算）。`v0.3` 起错误码与 Billing 服务一致：输入不合法是 422 加具体错误码（如 `invalid_integer`、`invalid_identifier`），未配置收款是 503 `stripe_not_configured`，订单完成状态为 `fulfilled`。
@@ -54,7 +54,13 @@ meter.add(measuredUnits); // 每测到一段用量就加
 await meter.close(); // 把剩余用量报完
 ```
 
-上报失败时，同一批用量会以原事件 ID 在下一轮重试，不会重复扣费。进程崩溃最多丢一个间隔的用量（对商户是少收，不是多收）。
+上报失败按 Billing 的回答分开处理（前两种调用 `onError`，`flush()` / `close()` 也会抛出该错误）：
+
+- **暂时性**（网络错误、超时、5xx、408、429，以及 2xx 但响应体不是 JSON 对象的 `invalid_response`）：同一批用量以原事件 ID 在下一轮重试，不会重复扣费。
+- **永久拒绝**（其余 4xx，如 `event_conflict`、`invalid_metadata`、`invalid_integer`）：这是 Billing 的回答，不是故障，重试也只会再被拒。这一批被丢弃，之后的用量照常上报。
+- 例外：409 `account_closed` 表示账户已关闭、无法再扣费。meter 调用一次 `onStop`（带最后一次已知的余额，没有则为 `{ balance: "0", allowed: false }`），丢弃累计的用量并不再上报，不调用 `onError`。
+
+进程崩溃最多丢一个间隔的用量（对商户是少收，不是多收）。
 
 ## 自建购买页
 
@@ -86,10 +92,11 @@ const client = createBillingClient({ ...billing.config, fetch: billing.fetch });
 await billing.grant("user_1", "1000"); // 测试额度
 await billing.purchase("user_1", "5000"); // 模拟一次已付款的充值
 // 自建购买页：createTestBilling({ offers: [...] }) 上架额度包，checkout 建单后
-// billing.payOrder(orderId) 模拟付款成功
+// billing.payOrder(orderId) 模拟付款成功。createTestBilling({ checkoutPending: true })
+// 时新订单先是 creating、checkout_url 为 null，billing.readyOrder(orderId) 后才可付
 ```
 
-选项：`offers`（在售额度包）、`creditsPerUnit`、`payments`（false 时充值链接返回 503 `stripe_not_configured`）、`returnOrigin`（允许 `return_path`）、`now`。
+选项：`offers`（在售额度包）、`creditsPerUnit`、`payments`（false 时充值链接返回 503 `stripe_not_configured`）、`returnOrigin`（允许 `return_path`）、`now`、`checkoutPending`（新订单像生产一样稍后才有 `checkout_url`，用 `readyOrder` 推进）。
 
 假服务只覆盖产品接口，不包括托管充值页、Stripe 和管理端；通过它不代表部署可用。
 

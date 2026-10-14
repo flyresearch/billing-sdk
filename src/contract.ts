@@ -180,6 +180,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
         });
       const first = await client.history("u");
       expect(first.data).toHaveLength(50);
+      expect(first.has_more).toBe(true);
       expect(first.data[0]).toMatchObject({
         type: "usage",
         credits: "-1",
@@ -202,6 +203,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
         order: { state: "fulfilled" },
       });
       expect(second.next_cursor).toBeNull();
+      expect(second.has_more).toBe(false);
       expect(
         (await client.history("u", { type: "purchase" })).data,
       ).toHaveLength(1);
@@ -240,6 +242,25 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       expect(await code(unpaid.client.createTopupSession("u"))).toBe(
         "503 stripe_not_configured",
       );
+    });
+
+    test("a top-up key replays its link; another body under it is idempotency_conflict", async () => {
+      const { client } = await world({ returnOrigin: "https://product.test" });
+      const link = await client.createTopupSession("u", {}, "topup-1");
+      expect(await client.createTopupSession("u", {}, "topup-1")).toEqual(link);
+      expect(
+        await code(
+          client.createTopupSession(
+            "u",
+            { return_path: "/billing" },
+            "topup-1",
+          ),
+        ),
+      ).toBe("409 idempotency_conflict");
+      expect(await code(client.createTopupSession("v", {}, "topup-1"))).toBe(
+        "409 idempotency_conflict",
+      );
+      expect(await client.createTopupSession("u")).not.toEqual(link);
     });
 
     test("a debt is paid off by the next purchase", async () => {
@@ -323,6 +344,32 @@ export function contractSuite(name: string, create: CreateTestBilling) {
         ["s:1", "-30"],
       ]);
       expect((await client.balance("u")).balance).toBe("65");
+    });
+
+    test("createMeter drops a batch Billing refuses and goes on with the next", async () => {
+      const { billing, client } = await world();
+      await billing.grant("u", "100");
+      // s:1 is taken with other content, so the meter's first batch is refused.
+      await client.reportUsage("u", { event_id: "s:1", units: "1" });
+      const errors: unknown[] = [];
+      const meter = createMeter(client, {
+        customer: "u",
+        eventPrefix: "s",
+        intervalMs: 60_000,
+        onError: (e) => errors.push(e),
+      });
+      meter.add(30);
+      expect(await code(meter.flush())).toBe("409 event_conflict");
+      meter.add(5);
+      await meter.close();
+      expect(errors).toHaveLength(1);
+      const usage = (await client.history("u", { type: "usage" })).data.map(
+        (e) => [e.event_id, e.credits],
+      );
+      expect(usage).toEqual([
+        ["s:2", "-5"],
+        ["s:1", "-1"],
+      ]);
     });
 
     // 自建购买页：catalog 列出额度包，checkout 建单，order 读结果。
@@ -565,6 +612,28 @@ export function contractSuite(name: string, create: CreateTestBilling) {
           return_path: "/billing",
         }),
       ).toMatchObject({ state: "pending" });
+    });
+
+    test("with checkoutPending an order starts creating, without a URL, until it is ready", async () => {
+      const { billing, client } = await world({
+        ...packs,
+        checkoutPending: true,
+      });
+      const receipt = await client.checkout("u", {
+        sku: "pack-100",
+        purchase_ref: "p1",
+      });
+      if (!("order_id" in receipt)) throw new Error("expected an order");
+      expect(await client.order("u", receipt.order_id)).toMatchObject({
+        state: "creating",
+        checkout_url: null,
+      });
+      await billing.readyOrder(receipt.order_id);
+      const order = await client.order("u", receipt.order_id);
+      expect(order.state).toBe("awaiting_payment");
+      expect(typeof order.checkout_url).toBe("string");
+      await billing.readyOrder(receipt.order_id);
+      expect(await client.order("u", receipt.order_id)).toEqual(order);
     });
   });
 }

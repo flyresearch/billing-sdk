@@ -40,6 +40,12 @@ export interface TestBillingOptions {
   returnOrigin?: string;
   /** 服务端时钟，默认 Date.now */
   now?: () => number;
+  /**
+   * 默认 false：新订单立即可付（awaiting_payment，带 checkout_url）。true 时像
+   * 生产一样，新订单先是 creating、checkout_url 为 null，readyOrder() 之后才可付；
+   * 用来测试产品对“链接稍后才有”的处理
+   */
+  checkoutPending?: boolean;
 }
 
 /** createTestBilling 的返回值；Billing 仓库里的真服务实现同一个接口 */
@@ -54,6 +60,11 @@ export interface TestBilling {
   purchase(customer: string, credits: string): Promise<void>;
   /** 模拟 checkout 建的订单付款成功：订单 fulfilled，额度到账（先抵欠额） */
   payOrder(orderId: string): Promise<void>;
+  /**
+   * checkoutPending 下让 creating 的订单就绪：awaiting_payment，带 checkout_url。
+   * 已就绪的订单不变
+   */
+  readyOrder(orderId: string): Promise<void>;
   close(): void;
 }
 
@@ -142,8 +153,8 @@ interface TestOrder {
   amount: string;
   currency: string;
   credits: string;
-  state: "awaiting_payment" | "fulfilled";
-  checkout_url: string;
+  state: "creating" | "awaiting_payment" | "fulfilled";
+  checkout_url: string | null;
   exception: null;
   created_at: string;
   fulfilled_at: string | null;
@@ -165,7 +176,9 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
     offer_version: `test-v${i + 1}`,
   }));
   const orders: TestOrder[] = [];
-  const checkoutKeys = new Map<string, { request: string; result: unknown }>();
+  // Product request keys: checkouts and top-up sessions share one namespace, as
+  // in the service.
+  const requestKeys = new Map<string, { request: string; result: unknown }>();
   const publicOrder = ({ seq: _, customer: __, ...order }: TestOrder) => order;
 
   const balanceOf = (customer: string) => balances.get(customer) ?? 0;
@@ -318,8 +331,6 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
     }
     if (action === "POST topup-sessions") {
       const input = await body(request);
-      // The service binds a top-up request to its Idempotency-Key, as it does purchases.
-      id(request.headers.get("idempotency-key"), "Idempotency-Key");
       for (const key of Object.keys(input))
         if (key !== "return_path")
           invalid("unexpected_field", `unknown field ${key}`);
@@ -347,13 +358,26 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
           "stripe_not_configured",
           "this product has no Stripe configuration",
         );
-      return {
-        status: 201,
-        body: {
-          url: `${ORIGIN}/topup/ts_${hex()}`,
-          expires_at: new Date(now() + 30 * 60_000).toISOString(),
-        },
+      // The same key and body return the same link; another body under the
+      // key is idempotency_conflict.
+      const key = id(request.headers.get("idempotency-key"), "Idempotency-Key");
+      const transport = canonical({ route: "topup.session", customer, input });
+      const replay = requestKeys.get(key);
+      if (replay) {
+        if (replay.request !== transport)
+          throw new Refusal(
+            409,
+            "idempotency_conflict",
+            "this Idempotency-Key was used with different content",
+          );
+        return { status: 201, body: replay.result };
+      }
+      const result = {
+        url: `${ORIGIN}/topup/ts_${hex()}`,
+        expires_at: new Date(now() + 30 * 60_000).toISOString(),
       };
+      requestKeys.set(key, { request: transport, result });
+      return { status: 201, body: result };
     }
     if (action === "POST checkouts") {
       const input = await body(request);
@@ -412,7 +436,7 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
         input: rest,
         ...(offer_version === undefined ? {} : { quote: offer_version }),
       });
-      const replay = checkoutKeys.get(key);
+      const replay = requestKeys.get(key);
       if (replay) {
         if (replay.request !== transport)
           throw new Refusal(
@@ -423,7 +447,7 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
         return { status: 202, body: replay.result };
       }
       const remember = (result: unknown) => {
-        checkoutKeys.set(key, { request: transport, result });
+        requestKeys.set(key, { request: transport, result });
         return { status: 202, body: result };
       };
       let order = orders.find(
@@ -469,8 +493,12 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
           amount,
           currency: offer!.currency,
           credits,
-          state: "awaiting_payment",
-          checkout_url: `${ORIGIN}/checkout/${orderId}`,
+          ...(options.checkoutPending
+            ? { state: "creating" as const, checkout_url: null }
+            : {
+                state: "awaiting_payment" as const,
+                checkout_url: `${ORIGIN}/checkout/${orderId}`,
+              }),
           exception: null,
           created_at: iso(),
           fulfilled_at: null,
@@ -534,6 +562,7 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
             ...(e.note === undefined ? {} : { note: e.note }),
             ...(e.order === undefined ? {} : { order: e.order }),
           })),
+          has_more: rows.length > PAGE,
           next_cursor:
             rows.length > PAGE ? String(page[page.length - 1]!.seq) : null,
         },
@@ -590,6 +619,13 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
           state: "fulfilled",
         },
       });
+    },
+    async readyOrder(orderId) {
+      const order = orders.find((o) => o.id === orderId);
+      if (!order) throw new Error(`no order ${orderId}`);
+      if (order.state !== "creating") return;
+      order.state = "awaiting_payment";
+      order.checkout_url = `${ORIGIN}/checkout/${order.id}`;
     },
     close() {},
   };
