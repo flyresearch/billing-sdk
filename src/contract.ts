@@ -258,6 +258,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
         customer: "u",
         eventPrefix: "session-1",
         intervalMs: 60_000,
+        metadata: { agent: "support" },
         onStop: (s) => stops.push(s),
       });
       meter.add(30);
@@ -277,6 +278,10 @@ export function contractSuite(name: string, create: CreateTestBilling) {
         ["session-1:2", "-70"],
         ["session-1:1", "-40"],
       ]);
+      const usageEntries = (await client.history("u", { type: "usage" })).data;
+      expect(usageEntries.every((e) => e.metadata?.agent === "support")).toBe(
+        true,
+      );
     });
 
     test("createMeter retries a failed batch under the same event id, so nothing is charged twice", async () => {

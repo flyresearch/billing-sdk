@@ -133,6 +133,8 @@ export interface MeterOptions {
   eventPrefix: string;
   /** 上报间隔，默认 5000 毫秒。间隔越短，余额用尽后的超支越少 */
   intervalMs?: number;
+  /** 随每条用量记入流水的字符串键值（≤1 KB），例如是哪个 Agent 在运行 */
+  metadata?: Record<string, string>;
   /** 余额用尽（allowed 为 false）时调用一次，产品在这里结束工作 */
   onStop?: (standing: Standing) => void;
   /** 上报失败时调用；这一批用量会以同一个事件 ID 在下一轮重试 */
@@ -147,7 +149,11 @@ export interface MeterOptions {
 export function createMeter(client: BillingClient, options: MeterOptions) {
   let buffered = 0n;
   let sequence = 0;
-  let pending: { event_id: string; units: string } | null = null;
+  let pending: {
+    event_id: string;
+    units: string;
+    metadata?: Record<string, string>;
+  } | null = null;
   let stopped = false;
   let sending: Promise<void> | null = null;
 
@@ -156,6 +162,7 @@ export function createMeter(client: BillingClient, options: MeterOptions) {
       pending = {
         event_id: `${options.eventPrefix}:${++sequence}`,
         units: buffered.toString(),
+        ...(options.metadata ? { metadata: options.metadata } : {}),
       };
       buffered = 0n;
     }
