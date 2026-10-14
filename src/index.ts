@@ -117,6 +117,19 @@ export class BillingError extends Error {
   }
 }
 
+// The default checkout key: one per customer and purchase_ref, of fixed length
+// and plain ASCII whatever the IDs are (the service caps keys at 200 characters,
+// and HTTP headers take no arbitrary Unicode).
+async function checkoutKey(customer: string, purchaseRef: string) {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(`${customer}\n${purchaseRef}`),
+  );
+  return `checkout:${[...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")}`;
+}
+
 export function createBillingClient(config: BillingConfig) {
   const call = async <T>(
     method: "GET" | "POST",
@@ -136,10 +149,21 @@ export function createBillingClient(config: BillingConfig) {
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
-    const result = (await response.json().catch(() => ({}))) as Record<
-      string,
-      unknown
-    >;
+    const text = await response.text();
+    let result: Record<string, unknown>;
+    try {
+      result = (text ? JSON.parse(text) : {}) as Record<string, unknown>;
+    } catch {
+      // A success with an unreadable body is not a result: never read it as
+      // an empty one (that would turn `allowed` into undefined, i.e. "stop").
+      if (response.ok)
+        throw new BillingError(
+          response.status,
+          "invalid_response",
+          "Billing answered with a body that is not JSON",
+        );
+      result = {};
+    }
     if (!response.ok)
       throw new BillingError(
         response.status,
@@ -196,11 +220,13 @@ export function createBillingClient(config: BillingConfig) {
      * 用 order() 读 checkout_url（可能稍后才有）并把浏览器送过去，付款结果也以
      * order() 和余额为准，回跳页面不是付款凭证。
      */
-    checkout: (
-      id: string,
-      input: CheckoutInput,
-      key: string = `checkout:${id}:${input.purchase_ref}`,
-    ) => call<CheckoutReceipt>("POST", `${customer(id)}/checkouts`, input, key),
+    checkout: async (id: string, input: CheckoutInput, key?: string) =>
+      call<CheckoutReceipt>(
+        "POST",
+        `${customer(id)}/checkouts`,
+        input,
+        key ?? (await checkoutKey(id, input.purchase_ref)),
+      ),
 
     /** 一个订单的当前状态 */
     order: (id: string, orderId: string) =>

@@ -431,6 +431,20 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       });
     });
 
+    test("the default checkout key fits any customer and purchase_ref", async () => {
+      const { client } = await world(packs);
+      const customer = `用户-${"x".repeat(180)}`;
+      const ref = "r".repeat(190);
+      const receipt = await client.checkout(customer, {
+        sku: "pack-100",
+        purchase_ref: ref,
+      });
+      expect(receipt).toMatchObject({ state: "pending" });
+      expect(
+        await client.checkout(customer, { sku: "pack-100", purchase_ref: ref }),
+      ).toEqual(receipt);
+    });
+
     test("two customers may use the same purchase_ref; each gets their own order", async () => {
       const { client } = await world(packs);
       const a = await client.checkout("u", {
@@ -451,13 +465,17 @@ export function contractSuite(name: string, create: CreateTestBilling) {
 
     test("checkout refusals: changed key content, changed sku, stale quote, bad amounts", async () => {
       const { client } = await world(packs);
-      await client.checkout("u", { sku: "pack-100", purchase_ref: "p1" });
+      await client.checkout(
+        "u",
+        { sku: "pack-100", purchase_ref: "p1" },
+        "my-key-1",
+      );
       expect(
         await code(
           client.checkout(
             "u",
             { sku: "custom", purchase_ref: "p1", amount: "1000" },
-            "checkout:u:p1",
+            "my-key-1",
           ),
         ),
       ).toBe("409 idempotency_conflict");
