@@ -2,42 +2,55 @@
 
 Billing 产品接口（API v1）的客户端，以及给产品自己写测试用的内存 Billing。
 
-- `@flyresearch/billing-sdk`：零依赖、只用 `fetch` 的客户端，加上 `chargedRun` / `recoverCharge`（冻结 → 执行 → 结算的正确顺序与崩溃恢复）和充值辅助。Node 18+、Bun、Deno、Cloudflare Workers 都能用。
-- `@flyresearch/billing-sdk/testing`：内存假服务。按公开接口的规则行为，会像生产一样拒绝额度不足、同键不同参数、超出冻结上限或授权期的结算。
-- `@flyresearch/billing-sdk/contract`：契约测试。同一套测试在这里对假服务跑，在 Billing 服务仓库里对真服务跑，保证两者一致。
+模型是**先用后报**：开始工作前读一次余额，执行中按间隔上报已经发生的用量，余额用尽时 Billing 告诉你停下。超支最多一个上报间隔，下一次充值先抵扣。
 
-完整接入步骤见 Billing 服务自带的 `/docs/quickstart.html`。
+- `@flyresearch/billing-sdk`：零依赖、只用 `fetch` 的客户端和 `createMeter`。Node 18+、Bun、Deno、Cloudflare Workers 都能用。
+- `@flyresearch/billing-sdk/testing`：内存假服务，按公开接口的规则行为。
+- `@flyresearch/billing-sdk/contract`：契约测试。同一套测试在这里对假服务跑，在 Billing 服务仓库里对真服务跑，保证两者一致。
 
 ## 安装
 
 ```sh
-bun add github:flyresearch/billing-sdk#v0.1.0
+bun add github:flyresearch/billing-sdk#v0.2.0
 ```
 
-源码是 TypeScript，直接被 Bun、Deno 和 Workers 的打包器使用。
+源码是 TypeScript，直接被 Bun、Deno 和 Workers 的打包器使用。`v0.1.x` 是旧接口（冻结与结算），与 `v0.2` 不兼容。
 
-## 使用
+## 四个接口
+
+| 方法 | 作用 |
+|---|---|
+| `balance(customer)` | `{ balance, allowed }`；`allowed` 为 false 就不开始 |
+| `reportUsage(customer, { event_id, units, metadata? })` | 上报已发生的用量。`event_id` 即幂等键，重发不重复扣费 |
+| `createTopupSession(customer, { return_path? })` | 托管充值页链接（30 分钟有效），把用户浏览器送过去 |
+| `history(customer, { cursor?, type? })` | 充值、用量、退款、调账记录 |
+
+客户 ID 由你的产品定义，第一次出现时自动建立。金额和额度都是十进制整数字符串。
+
+## 用法
 
 ```ts
-import { createBillingClient, chargedRun } from "@flyresearch/billing-sdk";
+import { createBillingClient, createMeter } from "@flyresearch/billing-sdk";
 
-const billing = createBillingClient({ baseUrl, apiKey }); // product.json 里的 base_url / api_key
-const { url } = await billing.createTopupSession(userId, {
-  return_path: "/billing/done",
+const billing = createBillingClient({ baseUrl, apiKey }); // 控制台签发的产品密钥
+
+// 开始前
+if (!(await billing.balance(userId)).allowed) return showTopUp(await billing.createTopupSession(userId));
+
+// 执行中
+const meter = createMeter(billing, {
+  customer: userId,
+  eventPrefix: sessionId, // 每次工作唯一
+  intervalMs: 5000,
+  onStop: () => endSession("insufficient_credits"),
 });
-const { available } = await billing.balance(userId);
-const outcome = await chargedRun(
-  billing,
-  store,
-  input,
-  async ({ work_until }) => {
-    // 真实业务；返回可信的实际用量
-    return { units: "37", result };
-  },
-);
+meter.add(measuredUnits); // 每测到一段用量就加
+
+// 结束时
+await meter.close(); // 把剩余用量报完
 ```
 
-`store` 是你数据库里的五个操作（`ChargeStore`），用自己的事务实现。
+上报失败时，同一批用量会以原事件 ID 在下一轮重试，不会重复扣费。进程崩溃最多丢一个间隔的用量（对商户是少收，不是多收）。
 
 ## 测试
 
@@ -45,15 +58,15 @@ const outcome = await chargedRun(
 import { createBillingClient } from "@flyresearch/billing-sdk";
 import { createTestBilling } from "@flyresearch/billing-sdk/testing";
 
-const billing = await createTestBilling();
+const billing = await createTestBilling({ creditsPerUnit: 1 });
 const client = createBillingClient({ ...billing.config, fetch: billing.fetch });
-billing.grant("user_1", "1000"); // 测试额度
-await billing.pay(orderId); // 模拟付款完成
+await billing.grant("user_1", "1000"); // 测试额度
+await billing.purchase("user_1", "5000"); // 模拟一次已付款的充值
 ```
 
-选项：`config`（计量合同）、`offers`（在售额度包）、`returnOrigin`（允许 `return_path`）、`now`（可控时钟，用来测冻结过期）。
+选项：`creditsPerUnit`、`payments`（false 时充值链接返回 `payments_not_configured`）、`returnOrigin`（允许 `return_path`）、`now`。
 
-假服务只覆盖产品凭据能调用的接口，不包括管理端、退款、自定金额额度包和账户关闭；通过它不代表部署可用。
+假服务只覆盖产品接口，不包括托管充值页、Stripe 和管理端；通过它不代表部署可用。
 
 ## 许可
 
