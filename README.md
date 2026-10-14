@@ -18,12 +18,12 @@ bun add github:flyresearch/billing-sdk#v0.2.0
 
 ## 四个接口
 
-| 方法 | 作用 |
-|---|---|
-| `balance(customer)` | `{ balance, allowed }`；`allowed` 为 false 就不开始 |
+| 方法                                                    | 作用                                                  |
+| ------------------------------------------------------- | ----------------------------------------------------- |
+| `balance(customer)`                                     | `{ balance, allowed }`；`allowed` 为 false 就不开始   |
 | `reportUsage(customer, { event_id, units, metadata? })` | 上报已发生的用量。`event_id` 即幂等键，重发不重复扣费 |
-| `createTopupSession(customer, { return_path? })` | 托管充值页链接（30 分钟有效），把用户浏览器送过去 |
-| `history(customer, { cursor?, type? })` | 充值、用量、退款、调账记录 |
+| `createTopupSession(customer, { return_path? })`        | 托管充值页链接（30 分钟有效），把用户浏览器送过去     |
+| `history(customer, { cursor?, type? })`                 | 充值、用量、退款、调账记录                            |
 
 客户 ID 由你的产品定义，第一次出现时自动建立。金额和额度都是十进制整数字符串。
 
@@ -35,7 +35,8 @@ import { createBillingClient, createMeter } from "@flyresearch/billing-sdk";
 const billing = createBillingClient({ baseUrl, apiKey }); // 控制台签发的产品密钥
 
 // 开始前
-if (!(await billing.balance(userId)).allowed) return showTopUp(await billing.createTopupSession(userId));
+if (!(await billing.balance(userId)).allowed)
+  return showTopUp(await billing.createTopupSession(userId));
 
 // 执行中
 const meter = createMeter(billing, {
