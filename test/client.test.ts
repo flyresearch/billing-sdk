@@ -160,3 +160,34 @@ test("createMeter without a known standing stops with a zero balance on account_
   await meter.close();
   expect(stops).toEqual([{ balance: "0", allowed: false }]);
 });
+
+test("a refused key (401) keeps the batch for retry under the same event id", async () => {
+  const sent: string[] = [];
+  let refuse = true;
+  const client = createBillingClient({
+    baseUrl: "https://billing.test",
+    apiKey: "k",
+    fetch: (async (_url: unknown, init?: RequestInit) => {
+      sent.push(JSON.parse(String(init?.body)).event_id);
+      return refuse
+        ? Response.json({ code: "unauthorized" }, { status: 401 })
+        : Response.json({
+            event_id: "x",
+            credits: "5",
+            balance: "95",
+            allowed: true,
+          });
+    }) as unknown as typeof fetch,
+  });
+  const meter = createMeter(client, {
+    customer: "u",
+    eventPrefix: "s",
+    intervalMs: 60_000,
+    onError: () => {},
+  });
+  meter.add(5);
+  await meter.flush().catch(() => {});
+  refuse = false;
+  await meter.close();
+  expect(sent).toEqual(["s:1", "s:1"]);
+});

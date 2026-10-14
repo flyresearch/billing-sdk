@@ -284,15 +284,15 @@ export interface MeterOptions {
 
 /**
  * Billing 明确拒绝（不是故障）：4xx 且不是 invalid_response。408、429 是
- * “稍后再试”，仍算暂时性失败。
+ * “稍后再试”；401、403 是密钥被吊销或配错，修好后这些用量还要报上去，都算
+ * 暂时性失败。
  */
 function refused(error: unknown): error is BillingError {
   return (
     error instanceof BillingError &&
     error.status >= 400 &&
     error.status < 500 &&
-    error.status !== 408 &&
-    error.status !== 429 &&
+    ![401, 403, 408, 429].includes(error.status) &&
     error.code !== "invalid_response"
   );
 }
@@ -301,7 +301,7 @@ function refused(error: unknown): error is BillingError {
  * 按间隔批量上报用量。add() 累加，定时以递增的事件 ID 上报。进程崩溃最多丢一个
  * 间隔的用量（对商户是少收，不是多收）。失败分两种：
  *
- * - 暂时性（网络错误、超时、5xx、408、429、invalid_response）：调用 onError，
+ * - 暂时性（网络错误、超时、5xx、401、403、408、429、invalid_response）：调用 onError，
  *   同一批用量保持原事件 ID 在下一轮重试，所以不会重复扣费。
  * - 永久拒绝（其余 4xx，如 event_conflict、invalid_metadata、invalid_integer）：
  *   调用 onError，丢弃这一批（重试也只会再被拒），之后的用量照常上报。

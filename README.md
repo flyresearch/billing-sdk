@@ -56,7 +56,7 @@ await meter.close(); // 把剩余用量报完
 
 上报失败按 Billing 的回答分开处理（前两种调用 `onError`，`flush()` / `close()` 也会抛出该错误）：
 
-- **暂时性**（网络错误、超时、5xx、408、429，以及 2xx 但响应体不是 JSON 对象的 `invalid_response`）：同一批用量以原事件 ID 在下一轮重试，不会重复扣费。
+- **暂时性**（网络错误、超时、5xx、401/403（密钥被吊销或配错，修好后还要报上去）、408、429，以及 2xx 但响应体不是 JSON 对象的 `invalid_response`）：同一批用量以原事件 ID 在下一轮重试，不会重复扣费。
 - **永久拒绝**（其余 4xx，如 `event_conflict`、`invalid_metadata`、`invalid_integer`）：这是 Billing 的回答，不是故障，重试也只会再被拒。这一批被丢弃，之后的用量照常上报。
 - 例外：409 `account_closed` 表示账户已关闭、无法再扣费。meter 调用一次 `onStop`（带最后一次已知的余额，没有则为 `{ balance: "0", allowed: false }`），丢弃累计的用量并不再上报，不调用 `onError`。
 
