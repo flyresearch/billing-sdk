@@ -1,13 +1,37 @@
 // 产品测试用的内存 Billing（API v1，ADR-0014）。按公开接口的规则行为，不含
 // Billing 服务端代码：事件 ID 冲突、余额用尽、非法输入都会像生产一样返回。
 // 与真服务的一致性由 ./contract.ts 的契约测试保证：同一套测试在这里对它跑，
-// 在 Billing 仓库里对真服务跑。不覆盖托管充值页、Stripe 与管理端。
+// 在 Billing 仓库里对真服务跑。不覆盖托管充值页、Stripe 与管理端：建单得到的
+// checkout_url 不能打开，付款用 payOrder() 模拟。
 //
 //   const billing = await createTestBilling();
 //   const client = createBillingClient({ ...billing.config, fetch: billing.fetch });
 //   billing.grant("user_1", "1000");
 
+/** 测试用额度包。fixed：固定金额与额度；flexible：用户在范围内自定金额 */
+export type TestOffer =
+  | {
+      kind?: "fixed";
+      sku: string;
+      currency?: string;
+      amount: string;
+      credits: string;
+    }
+  | {
+      kind: "flexible";
+      sku: string;
+      currency?: string;
+      min_amount: string;
+      max_amount: string;
+      step?: string;
+      credits_per_unit: string;
+      /** 预填金额，须在范围内 */
+      amount: string;
+    };
+
 export interface TestBillingOptions {
+  /** 在售额度包，按顺序；默认没有。payments 为 false 时 catalog 不列出 */
+  offers?: TestOffer[];
   /** 每单位用量扣多少额度，默认 1 */
   creditsPerUnit?: number;
   /** 是否已配置收款，默认 true；false 时建充值链接返回 503 stripe_not_configured */
@@ -28,6 +52,8 @@ export interface TestBilling {
   grant(customer: string, credits: string): Promise<void>;
   /** 模拟一次已付款的充值（流水类型 purchase） */
   purchase(customer: string, credits: string): Promise<void>;
+  /** 模拟 checkout 建的订单付款成功：订单 fulfilled，额度到账（先抵欠额） */
+  payOrder(orderId: string): Promise<void>;
   close(): void;
 }
 
@@ -37,6 +63,14 @@ export type CreateTestBilling = (
 
 const ORIGIN = "https://billing.test";
 const PAGE = 50;
+const ORDER_PAGE = 25;
+// Stripe 的金额小数位（不是展示精度）：https://docs.stripe.com/currencies#special-cases
+const ZERO_DECIMAL = new Set(
+  "bif clp djf gnf jpy kmf krw mga pyg rwf vnd vuv xaf xof xpf".split(" "),
+);
+const THREE_DECIMAL = new Set("bhd jod kwd omr tnd".split(" "));
+const decimals = (currency: string) =>
+  ZERO_DECIMAL.has(currency) ? 0 : THREE_DECIMAL.has(currency) ? 3 : 2;
 
 class Refusal extends Error {
   constructor(
@@ -99,6 +133,22 @@ interface Entry {
   order?: { id: string; amount: string; currency: string; state: string };
 }
 
+interface TestOrder {
+  seq: number;
+  id: string;
+  customer: string;
+  purchase_ref: string;
+  sku: string;
+  amount: string;
+  currency: string;
+  credits: string;
+  state: "awaiting_payment" | "fulfilled";
+  checkout_url: string;
+  exception: null;
+  created_at: string;
+  fulfilled_at: string | null;
+}
+
 export const createTestBilling: CreateTestBilling = async (options = {}) => {
   const now = options.now ?? Date.now;
   const iso = () => new Date(now()).toISOString();
@@ -107,6 +157,16 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
   const balances = new Map<string, number>();
   const entries: Entry[] = [];
   let seq = 0;
+  const payments = options.payments !== false;
+  const offers = (options.offers ?? []).map((offer, i) => ({
+    ...offer,
+    kind: offer.kind ?? "fixed",
+    currency: offer.currency ?? "usd",
+    offer_version: `test-v${i + 1}`,
+  }));
+  const orders: TestOrder[] = [];
+  const checkoutKeys = new Map<string, { request: string; result: unknown }>();
+  const publicOrder = ({ seq: _, customer: __, ...order }: TestOrder) => order;
 
   const balanceOf = (customer: string) => balances.get(customer) ?? 0;
   const standing = (balance: number) => ({
@@ -161,9 +221,44 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
       );
     const url = new URL(request.url);
     const parts = url.pathname.split("/").slice(1).map(decodeURIComponent);
-    if (parts[0] !== "v1" || parts[1] !== "customers" || parts.length !== 4)
+    if (request.method === "GET" && url.pathname === "/v1/catalog")
+      return {
+        status: 200,
+        body: {
+          offers: payments
+            ? offers.map((offer) => ({
+                ...offer,
+                ...(offer.kind === "flexible"
+                  ? {
+                      credits: String(
+                        BigInt(offer.amount) *
+                          BigInt(
+                            (offer as { credits_per_unit: string })
+                              .credits_per_unit,
+                          ),
+                      ),
+                    }
+                  : {}),
+                amount_decimals: decimals(offer.currency),
+              }))
+            : [],
+          payment_methods: payments ? ["card"] : [],
+        },
+      };
+    if (
+      parts[0] !== "v1" ||
+      parts[1] !== "customers" ||
+      (parts.length !== 4 && !(parts.length === 5 && parts[3] === "orders"))
+    )
       throw new Refusal(404, "not_found", "no such route");
     const customer = id(parts[2], "customer");
+    if (parts.length === 5 && request.method === "GET") {
+      const order = orders.find(
+        (o) => o.id === parts[4] && o.customer === customer,
+      );
+      if (!order) throw new Refusal(404, "not_found", "no such order");
+      return { status: 200, body: publicOrder(order) };
+    }
     const action = `${request.method} ${parts[3]}`;
     if (action === "GET balance")
       return { status: 200, body: standing(balanceOf(customer)) };
@@ -260,6 +355,153 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
         },
       };
     }
+    if (action === "POST checkouts") {
+      const input = await body(request);
+      if (!payments)
+        throw new Refusal(
+          503,
+          "stripe_not_configured",
+          "this product has no Stripe configuration",
+        );
+      for (const key of Object.keys(input))
+        if (
+          ![
+            "offer_version",
+            "purchase_ref",
+            "sku",
+            "return_path",
+            "amount",
+            "payment_method",
+          ].includes(key)
+        )
+          invalid("unexpected_field", `unknown field ${key}`);
+      const { offer_version, ...rest } = input;
+      if (offer_version !== undefined) id(offer_version, "offer_version");
+      const ref = id(input.purchase_ref, "purchase_ref");
+      if (
+        input.payment_method !== undefined &&
+        id(input.payment_method, "payment_method") !== "card"
+      )
+        invalid(
+          "unsupported_payment_method",
+          "payment_method must be one the product configured",
+        );
+      const path = input.return_path;
+      if (
+        path !== undefined &&
+        (typeof path !== "string" ||
+          path.length < 1 ||
+          path.length > 512 ||
+          !path.startsWith("/") ||
+          path.startsWith("//") ||
+          path.includes("\\") ||
+          path.includes("#"))
+      )
+        invalid(
+          "invalid_return_path",
+          "return_path must be a path starting with /",
+        );
+      if (path !== undefined && !options.returnOrigin)
+        invalid(
+          "return_origin_not_configured",
+          "return_path needs the product's return origin configured",
+        );
+      const key = id(request.headers.get("idempotency-key"), "Idempotency-Key");
+      const transport = canonical({
+        customer,
+        input: rest,
+        ...(offer_version === undefined ? {} : { quote: offer_version }),
+      });
+      const replay = checkoutKeys.get(key);
+      if (replay) {
+        if (replay.request !== transport)
+          throw new Refusal(
+            409,
+            "idempotency_conflict",
+            "this Idempotency-Key was used with different content",
+          );
+        return { status: 202, body: replay.result };
+      }
+      const remember = (result: unknown) => {
+        checkoutKeys.set(key, { request: transport, result });
+        return { status: 202, body: result };
+      };
+      let order = orders.find(
+        (o) => o.customer === customer && o.purchase_ref === ref,
+      );
+      if (order && input.sku !== order.sku)
+        invalid("unsupported_sku", "a purchase_ref keeps its original sku");
+      if (!order && offer_version !== undefined) {
+        const current = offers.find((o) => o.sku === input.sku);
+        if (!current || current.offer_version !== offer_version)
+          return remember({ state: "rejected", reason: "offer_changed" });
+      }
+      if (!order) {
+        const offer = offers.find((o) => o.sku === input.sku);
+        if (!offer) invalid("unsupported_sku", "no such offer on sale");
+        let amount: string, credits: string;
+        if (offer!.kind === "flexible") {
+          const flexible = offer as Extract<TestOffer, { kind: "flexible" }>;
+          const value = BigInt(integer(input.amount, "amount"));
+          const min = BigInt(flexible.min_amount),
+            max = BigInt(flexible.max_amount),
+            step = BigInt(flexible.step ?? "1");
+          if (value < min || value > max || (value - min) % step !== 0n)
+            invalid(
+              "amount_out_of_range",
+              "amount is outside the offer's range",
+            );
+          amount = value.toString();
+          credits = (value * BigInt(flexible.credits_per_unit)).toString();
+        } else {
+          if (input.amount !== undefined)
+            invalid("amount_not_accepted", "a fixed offer takes no amount");
+          amount = offer!.amount;
+          credits = (offer as { credits: string }).credits;
+        }
+        const orderId = `order_${hex()}`;
+        order = {
+          seq: ++seq,
+          id: orderId,
+          customer,
+          purchase_ref: ref,
+          sku: offer!.sku,
+          amount,
+          currency: offer!.currency,
+          credits,
+          state: "awaiting_payment",
+          checkout_url: `${ORIGIN}/checkout/${orderId}`,
+          exception: null,
+          created_at: iso(),
+          fulfilled_at: null,
+        };
+        orders.push(order);
+      }
+      return remember({
+        order_id: order.id,
+        operation_id: `op_${hex()}`,
+        state: "pending",
+      });
+    }
+    if (action === "GET orders") {
+      const cursor = url.searchParams.get("cursor");
+      const before = cursor === null ? Infinity : integer(cursor, "cursor");
+      const rows = orders
+        .filter((o) => o.customer === customer && o.seq < before)
+        .reverse();
+      const page = rows.slice(0, ORDER_PAGE);
+      return {
+        status: 200,
+        body: {
+          data: page.map(publicOrder),
+          has_more: rows.length > ORDER_PAGE,
+          next_cursor:
+            rows.length > ORDER_PAGE
+              ? String(page[page.length - 1]!.seq)
+              : null,
+        },
+      };
+    }
     if (action === "GET history") {
       const cursor = url.searchParams.get("cursor");
       const type = url.searchParams.get("type");
@@ -330,6 +572,21 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
           id: `ord_${hex()}`,
           amount: "100",
           currency: "usd",
+          state: "fulfilled",
+        },
+      });
+    },
+    async payOrder(orderId) {
+      const order = orders.find((o) => o.id === orderId);
+      if (!order) throw new Error(`no order ${orderId}`);
+      if (order.state === "fulfilled") return;
+      order.state = "fulfilled";
+      order.fulfilled_at = iso();
+      append(order.customer, "purchase", Number(order.credits), {
+        order: {
+          id: order.id,
+          amount: order.amount,
+          currency: order.currency,
           state: "fulfilled",
         },
       });

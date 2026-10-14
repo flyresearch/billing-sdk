@@ -324,5 +324,211 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       ]);
       expect((await client.balance("u")).balance).toBe("65");
     });
+
+    // 自建购买页：catalog 列出额度包，checkout 建单，order 读结果。
+    const packs = {
+      offers: [
+        { sku: "pack-100", currency: "usd", amount: "500", credits: "100" },
+        {
+          kind: "flexible" as const,
+          sku: "custom",
+          currency: "usd",
+          min_amount: "100",
+          max_amount: "10000",
+          step: "100",
+          credits_per_unit: "3",
+          amount: "1000",
+        },
+      ],
+    };
+
+    test("the catalog lists offers with their quote version; without payments it is empty", async () => {
+      const { client } = await world(packs);
+      const catalog = await client.catalog();
+      expect(catalog.payment_methods).toContain("card");
+      expect(catalog.offers.map((o) => o.sku)).toEqual(["pack-100", "custom"]);
+      const [fixed, flexible] = catalog.offers;
+      expect(fixed).toMatchObject({
+        amount: "500",
+        currency: "usd",
+        credits: "100",
+        amount_decimals: 2,
+      });
+      expect(fixed!.kind ?? "fixed").toBe("fixed");
+      expect(typeof fixed!.offer_version).toBe("string");
+      expect(flexible).toMatchObject({
+        kind: "flexible",
+        min_amount: "100",
+        max_amount: "10000",
+        step: "100",
+        credits_per_unit: "3",
+        amount: "1000",
+        credits: "3000",
+      });
+      const unpaid = await world({ ...packs, payments: false });
+      expect(await unpaid.client.catalog()).toMatchObject({
+        offers: [],
+        payment_methods: [],
+      });
+      expect(
+        await code(
+          unpaid.client.checkout("u", { sku: "pack-100", purchase_ref: "p1" }),
+        ),
+      ).toBe("503 stripe_not_configured");
+    });
+
+    test("checkout creates one order per purchase_ref; paying it credits the customer", async () => {
+      const { billing, client } = await world(packs);
+      const receipt = await client.checkout("u", {
+        sku: "pack-100",
+        purchase_ref: "p1",
+      });
+      expect(receipt).toMatchObject({ state: "pending" });
+      if (!("order_id" in receipt)) throw new Error("expected an order");
+      // A retry, by key or by purchase_ref alone, names the same order.
+      expect(
+        await client.checkout("u", { sku: "pack-100", purchase_ref: "p1" }),
+      ).toMatchObject({ order_id: receipt.order_id });
+      expect(
+        await client.checkout(
+          "u",
+          { sku: "pack-100", purchase_ref: "p1" },
+          "another-key",
+        ),
+      ).toMatchObject({ order_id: receipt.order_id });
+      const order = await client.order("u", receipt.order_id);
+      expect(order).toMatchObject({
+        id: receipt.order_id,
+        purchase_ref: "p1",
+        sku: "pack-100",
+        amount: "500",
+        currency: "usd",
+        credits: "100",
+        state: "awaiting_payment",
+        exception: null,
+      });
+      expect((await client.orders("u")).data.map((o) => o.id)).toEqual([
+        receipt.order_id,
+      ]);
+      expect(await code(client.order("v", receipt.order_id))).toBe(
+        "404 not_found",
+      );
+      await client.reportUsage("u", { event_id: "s:1", units: "30" });
+      await billing.payOrder(receipt.order_id);
+      expect(await client.order("u", receipt.order_id)).toMatchObject({
+        state: "fulfilled",
+      });
+      // The purchase pays the debt off first.
+      expect(await client.balance("u")).toMatchObject({
+        balance: "70",
+        allowed: true,
+      });
+      const [purchase] = (await client.history("u", { type: "purchase" })).data;
+      expect(purchase).toMatchObject({
+        type: "purchase",
+        credits: "100",
+        order: { id: receipt.order_id, amount: "500", currency: "usd" },
+      });
+    });
+
+    test("checkout refusals: changed key content, changed sku, stale quote, bad amounts", async () => {
+      const { client } = await world(packs);
+      await client.checkout("u", { sku: "pack-100", purchase_ref: "p1" });
+      expect(
+        await code(
+          client.checkout(
+            "u",
+            { sku: "custom", purchase_ref: "p1", amount: "1000" },
+            "checkout:p1",
+          ),
+        ),
+      ).toBe("409 idempotency_conflict");
+      expect(
+        await code(
+          client.checkout(
+            "u",
+            { sku: "custom", purchase_ref: "p1", amount: "1000" },
+            "k2",
+          ),
+        ),
+      ).toBe("422 unsupported_sku");
+      expect(
+        await code(client.checkout("u", { sku: "nope", purchase_ref: "p2" })),
+      ).toBe("422 unsupported_sku");
+      // A stale quote is a definitive refusal under its key, not an error.
+      expect(
+        await client.checkout("u", {
+          sku: "pack-100",
+          purchase_ref: "p3",
+          offer_version: "stale",
+        }),
+      ).toEqual({ state: "rejected", reason: "offer_changed" });
+      const version = (await client.catalog()).offers[0]!.offer_version;
+      expect(
+        await client.checkout("u", {
+          sku: "pack-100",
+          purchase_ref: "p4",
+          offer_version: version,
+        }),
+      ).toMatchObject({ state: "pending" });
+      expect(
+        await code(
+          client.checkout("u", {
+            sku: "pack-100",
+            purchase_ref: "p5",
+            amount: "500",
+          }),
+        ),
+      ).toBe("422 amount_not_accepted");
+      for (const amount of ["50", "10100", "150"])
+        expect(
+          await code(
+            client.checkout("u", {
+              sku: "custom",
+              purchase_ref: `p6-${amount}`,
+              amount,
+            }),
+          ),
+        ).toBe("422 amount_out_of_range");
+      const flexible = await client.checkout("u", {
+        sku: "custom",
+        purchase_ref: "p7",
+        amount: "2000",
+      });
+      if (!("order_id" in flexible)) throw new Error("expected an order");
+      expect(await client.order("u", flexible.order_id)).toMatchObject({
+        amount: "2000",
+        credits: "6000",
+      });
+      expect(
+        await code(
+          client.checkout("u", {
+            sku: "pack-100",
+            purchase_ref: "p8",
+            payment_method: "bitcoin",
+          }),
+        ),
+      ).toBe("422 unsupported_payment_method");
+      expect(
+        await code(
+          client.checkout("u", {
+            sku: "pack-100",
+            purchase_ref: "p9",
+            return_path: "/billing",
+          }),
+        ),
+      ).toBe("422 return_origin_not_configured");
+      const routed = await world({
+        ...packs,
+        returnOrigin: "https://product.test",
+      });
+      expect(
+        await routed.client.checkout("u", {
+          sku: "pack-100",
+          purchase_ref: "p9",
+          return_path: "/billing",
+        }),
+      ).toMatchObject({ state: "pending" });
+    });
   });
 }

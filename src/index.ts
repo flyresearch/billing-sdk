@@ -3,6 +3,10 @@
 //
 // 模型：先用后报。开始前读一次余额（allowed 为 false 就不开始）；执行中按固定
 // 间隔上报已发生的用量；响应里 allowed 变成 false 就结束。用 createMeter 即可。
+//
+// 充值两条路：createTopupSession 把用户送到 Billing 托管的充值页（省事）；或者
+// 在产品自己的界面里用 catalog 列出额度包、checkout 建单、order 读结果（交互与
+// UI 和产品统一）。
 
 export interface BillingConfig {
   /** 服务地址，例如 https://billkernel.com */
@@ -37,6 +41,69 @@ export interface HistoryEntry {
   metadata?: Record<string, string>;
   note?: string;
   order?: { id: string; amount: string; currency: string; state: string };
+}
+
+/** 在售额度包。金额是最小货币单位的整数字符串，主单位 = 金额 ÷ 10^amount_decimals */
+export interface Offer {
+  /** 省略或 fixed：固定价与额度；flexible：用户在 min_amount..max_amount 内按 step 自定金额 */
+  kind?: "fixed" | "flexible";
+  sku: string;
+  /** 报价版本：建单时原样带回，套餐变了会被拒（offer_changed），不会按新价成交 */
+  offer_version: string;
+  currency: string;
+  /** fixed 的价格；flexible 的预填金额 */
+  amount: string;
+  /** fixed 的额度；flexible 预填金额对应的额度 */
+  credits: string;
+  amount_decimals: number;
+  /** 仅 flexible：额度 = 金额 × credits_per_unit */
+  credits_per_unit?: string;
+  min_amount?: string;
+  max_amount?: string;
+  step?: string;
+}
+
+export interface Catalog {
+  /** 按上架顺序；没有配置收款时为空 */
+  offers: Offer[];
+  /** 产品开通的收款方式，如 card、alipay、wechat_pay */
+  payment_methods: string[];
+}
+
+export interface CheckoutInput {
+  sku: string;
+  /** 产品自己的购买引用，先存进自己的库；重试用同一个，不会建第二单 */
+  purchase_ref: string;
+  /** catalog 里该档的 offer_version；省略则不做报价核对 */
+  offer_version?: string;
+  /** 仅 flexible：最小货币单位的整数字符串，fixed 不能传 */
+  amount?: string;
+  /** 只接受 catalog.payment_methods 之一；省略则收银台展示全部 */
+  payment_method?: string;
+  /** 付完回到产品的路径（需要在控制台配置回跳站点） */
+  return_path?: string;
+}
+
+/** 建单回执（HTTP 202）：只说明已受理，订单状态以 order() 为准 */
+export type CheckoutReceipt =
+  | { order_id: string; operation_id: string; state: "pending" }
+  | { state: "rejected"; reason: "offer_changed" };
+
+export interface Order {
+  id: string;
+  purchase_ref: string;
+  sku: string;
+  amount: string;
+  currency: string;
+  credits: string;
+  /** creating → awaiting_payment → fulfilled；另有 expired、refunded */
+  state: "creating" | "awaiting_payment" | "fulfilled" | "expired" | "refunded";
+  /** Stripe 收银台地址；刚建单时可能还是 null，稍后再读 */
+  checkout_url: string | null;
+  /** 非空表示需要人工核实（争议、部分退款等） */
+  exception: string | null;
+  created_at: string;
+  fulfilled_at: string | null;
 }
 
 export class BillingError extends Error {
@@ -116,6 +183,35 @@ export function createBillingClient(config: BillingConfig) {
         `${customer(id)}/topup-sessions`,
         options,
         key,
+      ),
+
+    /** 在售额度包与收款方式，自建购买页用 */
+    catalog: () => call<Catalog>("GET", "/v1/catalog"),
+
+    /**
+     * 自建购买页建单。purchase_ref 先存进产品自己的库再调用；重试用同一个
+     * purchase_ref（幂等键默认由它派生），不会建第二单。回执只说明已受理：
+     * 用 order() 读 checkout_url（可能稍后才有）并把浏览器送过去，付款结果也以
+     * order() 和余额为准，回跳页面不是付款凭证。
+     */
+    checkout: (
+      id: string,
+      input: CheckoutInput,
+      key: string = `checkout:${input.purchase_ref}`,
+    ) => call<CheckoutReceipt>("POST", `${customer(id)}/checkouts`, input, key),
+
+    /** 一个订单的当前状态 */
+    order: (id: string, orderId: string) =>
+      call<Order>(
+        "GET",
+        `${customer(id)}/orders/${encodeURIComponent(orderId)}`,
+      ),
+
+    /** 这个客户的订单，新的在前 */
+    orders: (id: string, options: { cursor?: string } = {}) =>
+      call<{ data: Order[]; has_more: boolean; next_cursor: string | null }>(
+        "GET",
+        `${customer(id)}/orders${options.cursor ? `?cursor=${encodeURIComponent(options.cursor)}` : ""}`,
       ),
 
     /** 充值、用量、退款、调账记录，新的在前，每页 50 条 */
