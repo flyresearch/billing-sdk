@@ -11,10 +11,10 @@ Billing 产品接口（API v1）的客户端，以及给产品自己写测试用
 ## 安装
 
 ```sh
-bun add github:flyresearch/billing-sdk#v0.2.0
+bun add github:flyresearch/billing-sdk#v0.3.0
 ```
 
-源码是 TypeScript，直接被 Bun、Deno 和 Workers 的打包器使用。`v0.1.x` 是旧接口（冻结与结算），与 `v0.2` 不兼容。
+源码是 TypeScript，直接被 Bun、Deno 和 Workers 的打包器使用。`v0.1.x` 是旧接口（冻结与结算）。`v0.3` 起错误码与 Billing 服务一致：输入不合法是 422 加具体错误码（如 `invalid_integer`、`invalid_identifier`），未配置收款是 503 `stripe_not_configured`，订单完成状态为 `fulfilled`。
 
 ## 四个接口
 
@@ -65,7 +65,7 @@ await billing.grant("user_1", "1000"); // 测试额度
 await billing.purchase("user_1", "5000"); // 模拟一次已付款的充值
 ```
 
-选项：`creditsPerUnit`、`payments`（false 时充值链接返回 `payments_not_configured`）、`returnOrigin`（允许 `return_path`）、`now`。
+选项：`creditsPerUnit`、`payments`（false 时充值链接返回 503 `stripe_not_configured`）、`returnOrigin`（允许 `return_path`）、`now`。
 
 假服务只覆盖产品接口，不包括托管充值页、Stripe 和管理端；通过它不代表部署可用。
 

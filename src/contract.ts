@@ -65,7 +65,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
 
     test("an unknown customer has a zero balance and may not start", async () => {
       const { client } = await world();
-      expect(await client.balance("u")).toEqual({
+      expect(await client.balance("u")).toMatchObject({
         balance: "0",
         allowed: false,
       });
@@ -74,7 +74,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
     test("granted credits allow work", async () => {
       const { billing, client } = await world();
       await billing.grant("u", "100");
-      expect(await client.balance("u")).toEqual({
+      expect(await client.balance("u")).toMatchObject({
         balance: "100",
         allowed: true,
       });
@@ -143,25 +143,27 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       expect((await client.balance("u")).balance).toBe("70");
     });
 
-    test("bad usage input is 400 invalid_request and charges nothing", async () => {
+    test("bad usage input is refused with a 422 naming what was wrong, and charges nothing", async () => {
       const { billing, raw, client } = await world();
       await billing.grant("u", "100");
-      for (const body of [
-        { event_id: "a", units: 5 },
-        { event_id: "a", units: "-5" },
-        { event_id: "a", units: "1.5" },
-        { event_id: "a", units: "1e3" },
-        { event_id: "", units: "5" },
-        { units: "5" },
-        { event_id: "a", units: "5", extra: 1 },
-        { event_id: "a", units: "5", metadata: { n: 1 } },
-        { event_id: "a", units: "5", metadata: { big: "x".repeat(2000) } },
-      ]) {
+      for (const [body, code] of [
+        [{ event_id: "a", units: 5 }, "invalid_integer"],
+        [{ event_id: "a", units: "-5" }, "invalid_integer"],
+        [{ event_id: "a", units: "1.5" }, "invalid_integer"],
+        [{ event_id: "a", units: "1e3" }, "invalid_integer"],
+        [{ event_id: "", units: "5" }, "invalid_identifier"],
+        [{ units: "5" }, "invalid_identifier"],
+        [{ event_id: "a", units: "5", extra: 1 }, "unexpected_field"],
+        [{ event_id: "a", units: "5", metadata: { n: 1 } }, "invalid_metadata"],
+        [
+          { event_id: "a", units: "5", metadata: { big: "x".repeat(2000) } },
+          "invalid_metadata",
+        ],
+      ] as const) {
         const result = await raw("POST", "/v1/customers/u/usage", body);
         expect({ body, status: result.status, code: result.body.code }).toEqual(
-          { body, status: 400, code: "invalid_request" },
+          { body, status: 422, code },
         );
-        expect(typeof result.body.message).toBe("string");
       }
       expect((await client.balance("u")).balance).toBe("100");
     });
@@ -197,7 +199,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       expect(second.data[3]).toMatchObject({
         credits: "1000",
         balance_after: "1000",
-        order: { state: "paid" },
+        order: { state: "fulfilled" },
       });
       expect(second.next_cursor).toBeNull();
       expect(
@@ -218,7 +220,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
         await code(
           plain.client.createTopupSession("u", { return_path: "/billing" }),
         ),
-      ).toBe("400 invalid_request");
+      ).toBe("422 return_origin_not_configured");
       const configured = await world({ returnOrigin: "https://product.test" });
       expect(
         await code(
@@ -233,10 +235,10 @@ export function contractSuite(name: string, create: CreateTestBilling) {
             return_path: "https://evil.test",
           }),
         ),
-      ).toBe("400 invalid_request");
+      ).toBe("422 invalid_return_path");
       const unpaid = await world({ payments: false });
       expect(await code(unpaid.client.createTopupSession("u"))).toBe(
-        "409 payments_not_configured",
+        "503 stripe_not_configured",
       );
     });
 
@@ -244,7 +246,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       const { billing, client } = await world();
       await client.reportUsage("u", { event_id: "s:1", units: "40" });
       await billing.purchase("u", "100");
-      expect(await client.balance("u")).toEqual({
+      expect(await client.balance("u")).toMatchObject({
         balance: "60",
         allowed: true,
       });

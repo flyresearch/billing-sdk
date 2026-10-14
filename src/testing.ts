@@ -10,7 +10,7 @@
 export interface TestBillingOptions {
   /** 每单位用量扣多少额度，默认 1 */
   creditsPerUnit?: number;
-  /** 是否已配置收款，默认 true；false 时建充值链接返回 payments_not_configured */
+  /** 是否已配置收款，默认 true；false 时建充值链接返回 503 stripe_not_configured */
   payments?: boolean;
   /** 产品的回跳站点；配置后充值链接才接受 return_path */
   returnOrigin?: string;
@@ -47,8 +47,9 @@ class Refusal extends Error {
     super(message);
   }
 }
-const invalid = (message: string): never => {
-  throw new Refusal(400, "invalid_request", message);
+/** The service's validation refusals: 422 with a code naming what was wrong. */
+const invalid = (code: string, message: string): never => {
+  throw new Refusal(422, code, message);
 };
 function id(value: unknown, field: string): string {
   if (
@@ -58,6 +59,7 @@ function id(value: unknown, field: string): string {
     /[\u0000-\u001f\u007f]/.test(value)
   )
     invalid(
+      "invalid_identifier",
       `${field} must be a string of 1-200 characters without control characters`,
     );
   return value as string;
@@ -68,7 +70,7 @@ function integer(value: unknown, field: string): number {
     !/^(0|[1-9][0-9]{0,15})$/.test(value) ||
     !Number.isSafeInteger(Number(value))
   )
-    invalid(`${field} must be a decimal integer string`);
+    invalid("invalid_integer", `${field} must be a decimal integer string`);
   return Number(value);
 }
 function canonical(value: unknown): string {
@@ -139,10 +141,12 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
     try {
       value = JSON.parse(text);
     } catch {
-      invalid("body is not JSON");
+      (() => {
+        throw new Refusal(400, "invalid_json", "body is not JSON");
+      })();
     }
     if (typeof value !== "object" || value === null || Array.isArray(value))
-      invalid("body must be a JSON object");
+      invalid("invalid_body", "body must be a JSON object");
     return value as Record<string, unknown>;
   }
 
@@ -167,7 +171,7 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
       const input = await body(request);
       for (const key of Object.keys(input))
         if (!["event_id", "units", "metadata"].includes(key))
-          invalid(`unknown field ${key}`);
+          invalid("unexpected_field", `unknown field ${key}`);
       const eventId = id(input.event_id, "event_id");
       const units = integer(input.units, "units");
       const metadata = (input.metadata ?? null) as Record<
@@ -176,11 +180,11 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
       > | null;
       if (metadata !== null) {
         if (typeof metadata !== "object" || Array.isArray(metadata))
-          invalid("metadata must be an object of strings");
+          invalid("invalid_body", "metadata must be an object of strings");
         if (Object.values(metadata).some((v) => typeof v !== "string"))
-          invalid("metadata values must be strings");
+          invalid("invalid_metadata", "metadata values must be strings");
         if (new TextEncoder().encode(JSON.stringify(metadata)).length > 1024)
-          invalid("metadata must be at most 1 KB");
+          invalid("invalid_metadata", "metadata must be at most 1 KB");
       }
       const request_ = canonical({ customer, units, metadata });
       const old = entries.find((e) => e.event_id === eventId);
@@ -201,7 +205,8 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
         };
       }
       const credits = units * creditsPerUnit;
-      if (!Number.isSafeInteger(credits)) invalid("units out of range");
+      if (!Number.isSafeInteger(credits))
+        invalid("integer_overflow", "units out of range");
       const balance = append(customer, "usage", -credits, {
         event_id: eventId,
         request: request_,
@@ -219,7 +224,8 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
     if (action === "POST topup-sessions") {
       const input = await body(request);
       for (const key of Object.keys(input))
-        if (key !== "return_path") invalid(`unknown field ${key}`);
+        if (key !== "return_path")
+          invalid("unexpected_field", `unknown field ${key}`);
       const path = input.return_path;
       if (
         path !== undefined &&
@@ -229,15 +235,21 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
           path.startsWith("//") ||
           path.includes("\\"))
       )
-        invalid("return_path must be a path starting with /");
-      if (options.payments === false)
-        throw new Refusal(
-          409,
-          "payments_not_configured",
-          "this product has no Stripe configuration",
+        invalid(
+          "invalid_return_path",
+          "return_path must be a path starting with /",
         );
       if (path !== undefined && !options.returnOrigin)
-        invalid("return_path needs the product's return origin configured");
+        invalid(
+          "return_origin_not_configured",
+          "return_path needs the product's return origin configured",
+        );
+      if (options.payments === false)
+        throw new Refusal(
+          503,
+          "stripe_not_configured",
+          "this product has no Stripe configuration",
+        );
       return {
         status: 201,
         body: {
@@ -250,7 +262,10 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
       const cursor = url.searchParams.get("cursor");
       const type = url.searchParams.get("type");
       if (type && !["purchase", "usage", "refund", "adjustment"].includes(type))
-        invalid("type must be purchase, usage, refund or adjustment");
+        invalid(
+          "invalid_history_type",
+          "type must be purchase, usage, refund or adjustment",
+        );
       const before = cursor === null ? Infinity : integer(cursor, "cursor");
       const rows = entries
         .filter(
@@ -298,7 +313,7 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
 
   const positive = (credits: string) => {
     const n = integer(credits, "credits");
-    if (n <= 0) invalid("credits must be positive");
+    if (n <= 0) invalid("invalid_integer", "credits must be positive");
     return n;
   };
   return {
@@ -313,7 +328,7 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
           id: `ord_${hex()}`,
           amount: "100",
           currency: "usd",
-          state: "paid",
+          state: "fulfilled",
         },
       });
     },
