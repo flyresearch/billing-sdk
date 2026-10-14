@@ -223,6 +223,8 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
     }
     if (action === "POST topup-sessions") {
       const input = await body(request);
+      // The service binds a top-up request to its Idempotency-Key, as it does purchases.
+      id(request.headers.get("idempotency-key"), "Idempotency-Key");
       for (const key of Object.keys(input))
         if (key !== "return_path")
           invalid("unexpected_field", `unknown field ${key}`);

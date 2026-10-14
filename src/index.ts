@@ -55,6 +55,7 @@ export function createBillingClient(config: BillingConfig) {
     method: "GET" | "POST",
     path: string,
     body?: unknown,
+    idempotencyKey?: string,
   ): Promise<T> => {
     const send = config.fetch ?? fetch;
     const response = await send(new URL(path, config.baseUrl), {
@@ -62,6 +63,9 @@ export function createBillingClient(config: BillingConfig) {
       headers: {
         authorization: `Bearer ${config.apiKey}`,
         ...(body === undefined ? {} : { "content-type": "application/json" }),
+        ...(idempotencyKey === undefined
+          ? {}
+          : { "idempotency-key": idempotencyKey }),
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
@@ -99,13 +103,19 @@ export function createBillingClient(config: BillingConfig) {
 
     /**
      * 托管充值页链接（30 分钟有效）。把用户的浏览器送过去，付完回到产品的
-     * return_path（需要在控制台配置回跳站点）。
+     * return_path（需要在控制台配置回跳站点）。同一个 key 同样参数重发返回同一个
+     * 链接；不传则每次新建。
      */
-    createTopupSession: (id: string, options: { return_path?: string } = {}) =>
+    createTopupSession: (
+      id: string,
+      options: { return_path?: string } = {},
+      key: string = crypto.randomUUID(),
+    ) =>
       call<{ url: string; expires_at: string }>(
         "POST",
         `${customer(id)}/topup-sessions`,
         options,
+        key,
       ),
 
     /** 充值、用量、退款、调账记录，新的在前，每页 50 条 */
