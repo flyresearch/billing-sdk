@@ -190,14 +190,16 @@ export function createBillingClient(config: BillingConfig) {
 
     /**
      * 自建购买页建单。purchase_ref 先存进产品自己的库再调用；重试用同一个
-     * purchase_ref（幂等键默认由它派生），不会建第二单。回执只说明已受理：
+     * purchase_ref（幂等键默认由客户和它派生），不会建第二单。回执是
+     * offer_changed 时这次购买已终结：用户重新确认后换一个新的 purchase_ref。
+     * 回执只说明已受理：
      * 用 order() 读 checkout_url（可能稍后才有）并把浏览器送过去，付款结果也以
      * order() 和余额为准，回跳页面不是付款凭证。
      */
     checkout: (
       id: string,
       input: CheckoutInput,
-      key: string = `checkout:${input.purchase_ref}`,
+      key: string = `checkout:${id}:${input.purchase_ref}`,
     ) => call<CheckoutReceipt>("POST", `${customer(id)}/checkouts`, input, key),
 
     /** 一个订单的当前状态 */

@@ -11,7 +11,7 @@ Billing 产品接口（API v1）的客户端，以及给产品自己写测试用
 ## 安装
 
 ```sh
-bun add github:flyresearch/billing-sdk#v0.4.0
+bun add github:flyresearch/billing-sdk#v0.4.1
 ```
 
 源码是 TypeScript，直接被 Bun、Deno 和 Workers 的打包器使用。`v0.1.x` 是旧接口（冻结与结算）。`v0.3` 起错误码与 Billing 服务一致：输入不合法是 422 加具体错误码（如 `invalid_integer`、`invalid_identifier`），未配置收款是 503 `stripe_not_configured`，订单完成状态为 `fulfilled`。
@@ -73,7 +73,7 @@ if (receipt.state === "pending") {
 }
 ```
 
-回跳页面不是付款凭证：回来后读 `order()` 的 `state`（`fulfilled` 即已到账）和余额。自定金额档传 `amount`（最小货币单位），额度 = 金额 × `credits_per_unit`。
+回跳页面不是付款凭证：回来后读 `order()` 的 `state`（`fulfilled` 即已到账）和余额。回执是 `offer_changed` 时这次购买已终结，用户重新确认价格后换一个新的 `purchase_ref`。自定金额档传 `amount`（最小货币单位），额度 = 金额 × `credits_per_unit`。
 
 ## 测试
 

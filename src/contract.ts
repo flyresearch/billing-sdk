@@ -431,6 +431,24 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       });
     });
 
+    test("two customers may use the same purchase_ref; each gets their own order", async () => {
+      const { client } = await world(packs);
+      const a = await client.checkout("u", {
+        sku: "pack-100",
+        purchase_ref: "1",
+      });
+      const b = await client.checkout("v", {
+        sku: "pack-100",
+        purchase_ref: "1",
+      });
+      if (!("order_id" in a) || !("order_id" in b))
+        throw new Error("expected orders");
+      expect(a.order_id).not.toBe(b.order_id);
+      expect(await client.order("v", b.order_id)).toMatchObject({
+        purchase_ref: "1",
+      });
+    });
+
     test("checkout refusals: changed key content, changed sku, stale quote, bad amounts", async () => {
       const { client } = await world(packs);
       await client.checkout("u", { sku: "pack-100", purchase_ref: "p1" });
@@ -439,7 +457,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
           client.checkout(
             "u",
             { sku: "custom", purchase_ref: "p1", amount: "1000" },
-            "checkout:p1",
+            "checkout:u:p1",
           ),
         ),
       ).toBe("409 idempotency_conflict");
