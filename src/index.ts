@@ -84,9 +84,14 @@ export interface CheckoutInput {
   return_path?: string;
 }
 
-/** 建单回执（HTTP 202）：只说明已受理，订单状态以 order() 为准 */
+/**
+ * 建单结果（HTTP 201）：建单当场返回收银台地址。通常 state 为 awaiting_payment、
+ * checkout_url 可直接打开；同一个 purchase_ref 重发返回同一订单的当前状态（可能已
+ * fulfilled、expired、refunded）。只有之前的响应丢失且 Stripe 仍不可用时才可能是
+ * creating、checkout_url 为 null：用同一个 purchase_ref 重试即可。
+ */
 export type CheckoutReceipt =
-  | { order_id: string; operation_id: string; state: "pending" }
+  | { order_id: string; state: Order["state"]; checkout_url: string | null }
   | { state: "rejected"; reason: "offer_changed" };
 
 export interface Order {
@@ -98,7 +103,7 @@ export interface Order {
   credits: string;
   /** creating → awaiting_payment → fulfilled；另有 expired、refunded */
   state: "creating" | "awaiting_payment" | "fulfilled" | "expired" | "refunded";
-  /** Stripe 收银台地址；刚建单时可能还是 null，稍后再读 */
+  /** Stripe 收银台地址；只有 creating（建单响应丢失后）时为 null */
   checkout_url: string | null;
   /** 非空表示需要人工核实（争议、部分退款等） */
   exception: string | null;
@@ -219,9 +224,9 @@ export function createBillingClient(config: BillingConfig) {
      * 自建购买页建单。purchase_ref 先存进产品自己的库再调用；重试用同一个
      * purchase_ref（幂等键默认由客户和它派生），不会建第二单。回执是
      * offer_changed 时这次购买已终结：用户重新确认后换一个新的 purchase_ref。
-     * 回执只说明已受理：
-     * 用 order() 读 checkout_url（可能稍后才有）并把浏览器送过去，付款结果也以
-     * order() 和余额为准，回跳页面不是付款凭证。
+     * 结果里直接带 checkout_url，把浏览器送过去即可；503 时用同一个 purchase_ref
+     * 重试，会拿到同一个订单与同一个收银台。付款结果以 order() 和余额为准，
+     * 回跳页面不是付款凭证。
      */
     checkout: async (id: string, input: CheckoutInput, key?: string) =>
       call<CheckoutReceipt>(

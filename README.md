@@ -73,13 +73,11 @@ const receipt = await billing.checkout(userId, {
   offer_version: offer.offer_version, // 套餐变了会返回 { state: "rejected", reason: "offer_changed" }
   return_path: "/billing", // 需要在控制台配置回跳站点
 });
-if (receipt.state === "pending") {
-  const order = await billing.order(userId, receipt.order_id);
-  if (order.checkout_url) redirect(order.checkout_url); // 可能稍后才有，再读一次
-}
+if (receipt.state !== "rejected" && receipt.checkout_url)
+  redirect(receipt.checkout_url); // 建单当场返回收银台地址
 ```
 
-回跳页面不是付款凭证：回来后读 `order()` 的 `state`（`fulfilled` 即已到账）和余额。回执是 `offer_changed` 时这次购买已终结，用户重新确认价格后换一个新的 `purchase_ref`。自定金额档传 `amount`（最小货币单位），额度 = 金额 × `credits_per_unit`。
+建单当场返回收银台地址（HTTP 201）。Stripe 暂时不可用时返回 503：用同一个 `purchase_ref` 重试，会拿到同一个订单和同一个收银台，不会建第二单；同一个 `purchase_ref` 重发总是返回该订单的当前状态。回跳页面不是付款凭证：回来后读 `order()` 的 `state`（`fulfilled` 即已到账）和余额。回执是 `offer_changed` 时这次购买已终结，用户重新确认价格后换一个新的 `purchase_ref`。自定金额档传 `amount`（最小货币单位），额度 = 金额 × `credits_per_unit`。
 
 ## 测试
 
@@ -92,11 +90,10 @@ const client = createBillingClient({ ...billing.config, fetch: billing.fetch });
 await billing.grant("user_1", "1000"); // 测试额度
 await billing.purchase("user_1", "5000"); // 模拟一次已付款的充值
 // 自建购买页：createTestBilling({ offers: [...] }) 上架额度包，checkout 建单后
-// billing.payOrder(orderId) 模拟付款成功。createTestBilling({ checkoutPending: true })
-// 时新订单先是 creating、checkout_url 为 null，billing.readyOrder(orderId) 后才可付
+// billing.payOrder(orderId) 模拟付款成功
 ```
 
-选项：`offers`（在售额度包）、`creditsPerUnit`、`payments`（false 时充值链接返回 503 `stripe_not_configured`）、`returnOrigin`（允许 `return_path`）、`now`、`checkoutPending`（新订单像生产一样稍后才有 `checkout_url`，用 `readyOrder` 推进）。
+选项：`offers`（在售额度包）、`creditsPerUnit`、`payments`（false 时充值链接返回 503 `stripe_not_configured`）、`returnOrigin`（允许 `return_path`）、`now`。
 
 假服务只覆盖产品接口，不包括托管充值页、Stripe 和管理端；通过它不代表部署可用。
 

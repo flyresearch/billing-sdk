@@ -430,8 +430,10 @@ export function contractSuite(name: string, create: CreateTestBilling) {
         sku: "pack-100",
         purchase_ref: "p1",
       });
-      expect(receipt).toMatchObject({ state: "pending" });
+      // The checkout URL comes back at once, with the order.
+      expect(receipt).toMatchObject({ state: "awaiting_payment" });
       if (!("order_id" in receipt)) throw new Error("expected an order");
+      expect(typeof receipt.checkout_url).toBe("string");
       // A retry, by key or by purchase_ref alone, names the same order.
       expect(
         await client.checkout("u", { sku: "pack-100", purchase_ref: "p1" }),
@@ -465,6 +467,10 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       expect(await client.order("u", receipt.order_id)).toMatchObject({
         state: "fulfilled",
       });
+      // A replay after payment answers the same order as it is now.
+      expect(
+        await client.checkout("u", { sku: "pack-100", purchase_ref: "p1" }),
+      ).toMatchObject({ order_id: receipt.order_id, state: "fulfilled" });
       // The purchase pays the debt off first.
       expect(await client.balance("u")).toMatchObject({
         balance: "70",
@@ -486,7 +492,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
         sku: "pack-100",
         purchase_ref: ref,
       });
-      expect(receipt).toMatchObject({ state: "pending" });
+      expect(receipt).toMatchObject({ state: "awaiting_payment" });
       expect(
         await client.checkout(customer, { sku: "pack-100", purchase_ref: ref }),
       ).toEqual(receipt);
@@ -553,7 +559,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
           purchase_ref: "p4",
           offer_version: version,
         }),
-      ).toMatchObject({ state: "pending" });
+      ).toMatchObject({ state: "awaiting_payment" });
       expect(
         await code(
           client.checkout("u", {
@@ -611,29 +617,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
           purchase_ref: "p9",
           return_path: "/billing",
         }),
-      ).toMatchObject({ state: "pending" });
-    });
-
-    test("with checkoutPending an order starts creating, without a URL, until it is ready", async () => {
-      const { billing, client } = await world({
-        ...packs,
-        checkoutPending: true,
-      });
-      const receipt = await client.checkout("u", {
-        sku: "pack-100",
-        purchase_ref: "p1",
-      });
-      if (!("order_id" in receipt)) throw new Error("expected an order");
-      expect(await client.order("u", receipt.order_id)).toMatchObject({
-        state: "creating",
-        checkout_url: null,
-      });
-      await billing.readyOrder(receipt.order_id);
-      const order = await client.order("u", receipt.order_id);
-      expect(order.state).toBe("awaiting_payment");
-      expect(typeof order.checkout_url).toBe("string");
-      await billing.readyOrder(receipt.order_id);
-      expect(await client.order("u", receipt.order_id)).toEqual(order);
+      ).toMatchObject({ state: "awaiting_payment" });
     });
   });
 }
