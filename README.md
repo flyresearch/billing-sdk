@@ -11,12 +11,14 @@ Billing 产品接口（API v1）的客户端，以及给产品自己写测试用
 ## 安装
 
 ```sh
-bun add github:flyresearch/billing-sdk#v0.7.0
+bun add github:flyresearch/billing-sdk#v0.8.0
 ```
 
 源码是 TypeScript，直接被 Bun、Deno 和 Workers 的打包器使用。`v0.1.x` 是旧接口（冻结与结算）。`v0.3` 起错误码与 Billing 服务一致：输入不合法是 422 加具体错误码（如 `invalid_integer`、`invalid_identifier`），未配置收款是 503 `stripe_not_configured`，订单完成状态为 `fulfilled`。
 
 **v0.6 的不兼容变化**：客户端不再发送 `Idempotency-Key`，Billing 也不再读它。`checkout(customer, input, key?)` 与 `createTopupSession(customer, options, key?)` 去掉了第三个参数（key），`409 idempotency_conflict` 不再出现。重试由请求本身识别，不需要另配幂等键：用量看 `event_id`，建单看（客户，`purchase_ref`）。充值链接每次调用都是新的，同一个 key 不再返回同一个链接。
+
+**v0.8** 支持计量修改（ADR-0016，只加不改）：`catalog().config`（`version`、`metric`、`credits_per_unit`）进了类型；`reportUsage` 可带 `meter_version`，负责人改过计量时返回 409 `meter_changed`、不记账；`createMeter` 增加 `meterVersion` 与 `onMeterChanged`；用量回答多一个 `meter_version` 字段。假服务支持 `metric` 选项与 `billing.setMeter()`。
 
 **v0.7** 增加订阅档位（只加不改）：`catalog().plans`、`plan()`、`subscriptionCheckout()`、`changePlan()`、`cancelPlan()`、`resumePlan()`、`billingPortal()`；流水多一种类型 `expiry`（月度额度到期作废），月度额度发放记为 `adjustment`、`note` 为 `"allowance"`。没处理 `expiry` 的界面会把它当成未知类型，请补上显示。
 
@@ -73,6 +75,24 @@ await meter.close(); // 把剩余用量报完
 
 进程崩溃最多丢一个间隔的用量（对商户是少收，不是多收）。
 
+### 计量修改（ADR-0016）
+
+负责人可以在控制台修改产品的计量（比如从毫秒改成秒）。为了不把旧单位的用量按新单位记账，上报时带上计量版本：
+
+```ts
+const { config } = await billing.catalog(); // { version, metric, credits_per_unit }
+const meter = createMeter(billing, {
+  customer: userId,
+  eventPrefix: sessionId,
+  meterVersion: config.version,
+  onMeterChanged: (units) => {
+    // 这些用量（旧单位）没有记账：重读 config，换算成新单位后交给新的 meter
+  },
+});
+```
+
+计量改了以后，meter 停止上报，把没记账的用量和之后 `add` 的用量都交给 `onMeterChanged`，不会丢，也不会按新单位记旧数。不带版本的产品按当前计量记账；这种产品在负责人修改计量前，要先停止新工作、报完已有用量。
+
 ## 自建购买页
 
 ```ts
@@ -127,7 +147,7 @@ await billing.purchase("user_1", "5000"); // 模拟一次已付款的充值
 // billing.payOrder(orderId) 模拟付款成功
 ```
 
-选项：`offers`（在售额度包）、`plans`（在售档位）、`creditsPerUnit`、`payments`（false 时充值链接返回 503 `stripe_not_configured`）、`returnOrigin`（允许 `return_path`）、`now`。
+选项：`offers`（在售额度包）、`plans`（在售档位）、`creditsPerUnit`、`metric`（计量名，初始版本 `v1`；`billing.setMeter()` 模拟修改计量）、`payments`（false 时充值链接返回 503 `stripe_not_configured`）、`returnOrigin`（允许 `return_path`）、`now`。
 
 档位：免费档按月发放、先用、月底作废，与真服务一致（契约测试覆盖）。订阅是简化模拟：`subscriptionCheckout` 后用 `billing.paySubscription(subscriptionId)` 模拟付款；到期自动续费（已设到期取消的则结束）；用 `now` 选项推进时间。订阅部分不在契约内，跨期、扣款失败、退款等以 Billing 测试环境加 Stripe 测试时钟为准。
 

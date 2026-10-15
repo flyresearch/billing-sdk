@@ -90,6 +90,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
         credits: "90",
         balance: "10",
         allowed: true,
+        meter_version: "v1",
       });
       expect(
         await client.reportUsage("u", { event_id: "s:2", units: "5" }),
@@ -98,6 +99,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
         credits: "15",
         balance: "-5",
         allowed: false,
+        meter_version: "v1",
       });
     });
 
@@ -690,6 +692,91 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       expect(await code(client.changePlan("u", "free"))).toBe(
         "422 free_plan_not_subscribable",
       );
+    });
+
+    // ---- the meter (ADR-0016) ----
+    test("the catalog names the meter; a changed meter refuses usage of the old version and records nothing", async () => {
+      const { billing, client } = await world({ metric: "voice_ms" });
+      expect((await client.catalog()).config).toEqual({
+        version: "v1",
+        metric: "voice_ms",
+        credits_per_unit: "1",
+      });
+      await billing.grant("u", "10000");
+      expect(
+        await client.reportUsage("u", {
+          event_id: "s:1",
+          units: "1500",
+          meter_version: "v1",
+        }),
+      ).toMatchObject({ credits: "1500", meter_version: "v1" });
+      await billing.setMeter({
+        metric: "voice_seconds",
+        credits_per_unit: "1",
+      });
+      // The same meter again changes nothing.
+      await billing.setMeter({
+        metric: "voice_seconds",
+        credits_per_unit: "1",
+      });
+      const { config } = await client.catalog();
+      expect(config).toEqual({
+        version: "m2",
+        metric: "voice_seconds",
+        credits_per_unit: "1",
+      });
+      expect(
+        await code(
+          client.reportUsage("u", {
+            event_id: "s:2",
+            units: "2000",
+            meter_version: "v1",
+          }),
+        ),
+      ).toBe("409 meter_changed");
+      expect((await client.balance("u")).balance).toBe("8500");
+      // Converted, under the same event_id.
+      expect(
+        await client.reportUsage("u", {
+          event_id: "s:2",
+          units: "2",
+          meter_version: "m2",
+        }),
+      ).toMatchObject({ credits: "2", balance: "8498", meter_version: "m2" });
+      // A replay answers the first result, whatever version it names.
+      expect(
+        await client.reportUsage("u", {
+          event_id: "s:1",
+          units: "1500",
+          meter_version: "m2",
+        }),
+      ).toMatchObject({ credits: "1500" });
+    });
+
+    test("createMeter hands what it could not report to onMeterChanged when the meter changes", async () => {
+      const { billing, client } = await world({ metric: "voice_ms" });
+      await billing.grant("u", "100000");
+      const handed: bigint[] = [];
+      const meter = createMeter(client, {
+        customer: "u",
+        eventPrefix: "m",
+        intervalMs: 60_000,
+        meterVersion: "v1",
+        onMeterChanged: (units) => handed.push(units),
+      });
+      meter.add(1000);
+      await meter.flush();
+      await billing.setMeter({
+        metric: "voice_seconds",
+        credits_per_unit: "1",
+      });
+      meter.add(1500);
+      await meter.flush();
+      meter.add(700);
+      await meter.close();
+      // Units added after the change go the same way.
+      expect(handed).toEqual([1500n, 700n]);
+      expect((await client.balance("u")).balance).toBe("99000");
     });
   });
 }

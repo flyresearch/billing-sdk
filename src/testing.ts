@@ -53,6 +53,8 @@ export interface TestBillingOptions {
   plans?: TestPlan[];
   /** 每单位用量扣多少额度，默认 1 */
   creditsPerUnit?: number;
+  /** 计量名，默认 units；初始版本为 v1 */
+  metric?: string;
   /** 是否已配置收款，默认 true；false 时建充值链接返回 503 stripe_not_configured */
   payments?: boolean;
   /** 产品的回跳站点；配置后充值链接才接受 return_path */
@@ -73,6 +75,8 @@ export interface TestBilling {
   purchase(customer: string, credits: string): Promise<void>;
   /** 模拟 checkout 建的订单付款成功：订单 fulfilled，额度到账（先抵欠额） */
   payOrder(orderId: string): Promise<void>;
+  /** 模拟负责人修改计量（ADR-0016）：生成新版本，只影响之后的用量 */
+  setMeter(meter: { metric: string; credits_per_unit: string }): Promise<void>;
   close(): void;
 }
 
@@ -206,7 +210,11 @@ export const createTestBilling = async (
   const now = options.now ?? Date.now;
   const iso = () => new Date(now()).toISOString();
   const apiKey = `bk_test_${hex()}`;
-  const creditsPerUnit = options.creditsPerUnit ?? 1;
+  let meter = {
+    version: "v1",
+    metric: options.metric ?? "units",
+    credits_per_unit: String(options.creditsPerUnit ?? 1),
+  };
   const balances = new Map<string, number>();
   const entries: Entry[] = [];
   let seq = 0;
@@ -461,6 +469,7 @@ export const createTestBilling = async (
                 amount_decimals: decimals(offer.currency),
               }))
             : [],
+          config: meter,
           plans,
           payment_methods: payments ? ["card"] : [],
         },
@@ -597,10 +606,14 @@ export const createTestBilling = async (
     if (action === "POST usage") {
       const input = await body(request);
       for (const key of Object.keys(input))
-        if (!["event_id", "units", "metadata"].includes(key))
+        if (!["event_id", "units", "metadata", "meter_version"].includes(key))
           invalid("unexpected_field", `unknown field ${key}`);
       const eventId = id(input.event_id, "event_id");
       const units = integer(input.units, "units");
+      const meterVersion =
+        input.meter_version === undefined
+          ? null
+          : id(input.meter_version, "meter_version");
       const metadata = (input.metadata ?? null) as Record<
         string,
         string
@@ -629,10 +642,17 @@ export const createTestBilling = async (
             event_id: eventId,
             credits: String(-old.credits),
             ...standing(balanceOf(customer)),
+            meter_version: meter.version,
           },
         };
       }
-      const credits = units * creditsPerUnit;
+      if (meterVersion !== null && meterVersion !== meter.version)
+        throw new Refusal(
+          409,
+          "meter_changed",
+          "the meter changed; report again in the new unit",
+        );
+      const credits = units * Number(meter.credits_per_unit);
       if (!Number.isSafeInteger(credits))
         invalid("integer_overflow", "units out of range");
       spendAllowances(customer, credits);
@@ -647,6 +667,7 @@ export const createTestBilling = async (
           event_id: eventId,
           credits: String(credits),
           ...standing(balance),
+          meter_version: meter.version,
         },
       };
     }
@@ -922,6 +943,22 @@ export const createTestBilling = async (
           state: "fulfilled",
         },
       });
+    },
+    async setMeter(next) {
+      id(next.metric, "metric");
+      if (integer(next.credits_per_unit, "credits_per_unit") <= 0)
+        invalid("invalid_integer", "credits_per_unit must be positive");
+      if (
+        next.metric === meter.metric &&
+        next.credits_per_unit === meter.credits_per_unit
+      )
+        return;
+      const n = /^m([1-9][0-9]{0,8})$/.exec(meter.version);
+      meter = {
+        version: `m${n ? Number(n[1]) + 1 : 2}`,
+        metric: next.metric,
+        credits_per_unit: next.credits_per_unit,
+      };
     },
     async paySubscription(subscriptionId) {
       const sub = subscriptions.find((s) => s.id === subscriptionId);

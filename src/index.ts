@@ -1,4 +1,4 @@
-// Billing 产品接口（API v1，ADR-0014、ADR-0015）的客户端。零依赖，只用 fetch，
+// Billing 产品接口（API v1，ADR-0014、ADR-0015、ADR-0016）的客户端。零依赖，只用 fetch，
 // Node 18+、Bun、Deno、Cloudflare Workers 都能用。
 //
 // 不发送 Idempotency-Key：Billing 按请求指向的对象识别重试。用量看 event_id，
@@ -36,6 +36,17 @@ export interface UsageResult extends Standing {
   event_id: string;
   /** 这条用量扣了多少额度 */
   credits: string;
+  /** 当前计量版本（ADR-0016） */
+  meter_version: string;
+}
+
+/** 产品的计量（ADR-0016）：一条用量扣 units × credits_per_unit 额度 */
+export interface Meter {
+  /** 负责人每次修改计量都会生成新版本 */
+  version: string;
+  /** 计量名，如 voice_seconds */
+  metric: string;
+  credits_per_unit: string;
 }
 
 export interface HistoryEntry {
@@ -124,6 +135,8 @@ export interface SubscriptionReceipt {
 }
 
 export interface Catalog {
+  /** 当前计量；上报用量时把 version 作为 meter_version 带上 */
+  config: Meter;
   /** 按上架顺序；没有配置收款时为空 */
   offers: Offer[];
   /** 在售档位，按价格从低到高 */
@@ -235,6 +248,8 @@ export function createBillingClient(config: BillingConfig) {
      * 上报已经发生的用量。event_id 就是幂等键：同一个 event_id 同样内容重发
      * 返回原结果，不会重复扣费；内容不同返回 409 event_conflict。
      * 用量一定会被记账；响应的 allowed 为 false 时结束工作。
+     * 带上 meter_version（catalog().config.version）时，负责人改过计量会返回
+     * 409 meter_changed、不记账：重读计量，换算成新单位后重报（可沿用 event_id）。
      */
     reportUsage: (
       id: string,
@@ -242,6 +257,7 @@ export function createBillingClient(config: BillingConfig) {
         event_id: string;
         units: string;
         metadata?: Record<string, string>;
+        meter_version?: string;
       },
     ) => call<UsageResult>("POST", `${customer(id)}/usage`, usage),
 
@@ -360,6 +376,13 @@ export interface MeterOptions {
   onStop?: (standing: Standing) => void;
   /** 上报失败时调用；暂时性失败会重试这一批，永久拒绝会丢弃这一批（见 createMeter） */
   onError?: (error: unknown) => void;
+  /**
+   * 计量版本（catalog().config.version），随每条用量上报。和 onMeterChanged
+   * 一起给：负责人改了计量时，meter 停止上报，把还没记账的用量（旧单位）交给
+   * onMeterChanged，由产品换算成新单位后用新的 meter 继续。
+   */
+  meterVersion?: string;
+  onMeterChanged?: (unreportedUnits: bigint) => void;
 }
 
 /**
@@ -398,9 +421,11 @@ export function createMeter(client: BillingClient, options: MeterOptions) {
     event_id: string;
     units: string;
     metadata?: Record<string, string>;
+    meter_version?: string;
   } | null = null;
   let stopped = false;
   let closed = false;
+  let meterChanged = false;
   let last: Standing = { balance: "0", allowed: false };
   let sending: Promise<void> | null = null;
 
@@ -416,6 +441,9 @@ export function createMeter(client: BillingClient, options: MeterOptions) {
         event_id: `${options.eventPrefix}:${++sequence}`,
         units: buffered.toString(),
         ...(options.metadata ? { metadata: options.metadata } : {}),
+        ...(options.meterVersion
+          ? { meter_version: options.meterVersion }
+          : {}),
       };
       buffered = 0n;
     }
@@ -426,6 +454,18 @@ export function createMeter(client: BillingClient, options: MeterOptions) {
       last = { balance: result.balance, allowed: result.allowed };
       if (!result.allowed) stop(last);
     } catch (error) {
+      if (refused(error) && error.code === "meter_changed") {
+        // Nothing of this batch was recorded: hand it over, with what came
+        // after it, to be converted and reported in the new meter.
+        closed = true;
+        meterChanged = true;
+        clearInterval(timer);
+        const unreported = BigInt(pending!.units) + buffered;
+        pending = null;
+        buffered = 0n;
+        options.onMeterChanged?.(unreported);
+        return;
+      }
       if (refused(error) && error.code === "account_closed") {
         closed = true;
         clearInterval(timer);
@@ -451,7 +491,11 @@ export function createMeter(client: BillingClient, options: MeterOptions) {
     add(units: number | bigint) {
       const value = BigInt(units);
       if (value < 0n) throw new RangeError("units must not be negative");
-      if (!closed) buffered += value;
+      // After a meter change nothing is reported here; later units go the
+      // same way as the unreported ones, so none is lost.
+      if (meterChanged) {
+        if (value > 0n) options.onMeterChanged?.(value);
+      } else if (!closed) buffered += value;
     },
     /** 立即上报累计的用量 */
     flush,
