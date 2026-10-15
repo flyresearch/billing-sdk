@@ -165,18 +165,10 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
     offer_version: `test-v${i + 1}`,
   }));
   const orders: TestOrder[] = [];
-  // Product request keys: checkouts and top-up sessions share one namespace, as
-  // in the service.
-  const requestKeys = new Map<string, { request: string; result: unknown }>();
+  // Checkout refusals, durable per (customer, purchase_ref) as in the service:
+  // a refused purchase_ref never creates an order.
+  const refusals = new Map<string, string>();
   const publicOrder = ({ seq: _, customer: __, ...order }: TestOrder) => order;
-  // A checkout answers with its order's current view; a refusal stays as it was.
-  const receipt = (result: unknown) => {
-    const id = (result as { order_id?: string }).order_id;
-    const order = id === undefined ? undefined : orders.find((o) => o.id === id);
-    return order
-      ? { order_id: order.id, state: order.state, checkout_url: order.checkout_url }
-      : result;
-  };
 
   const balanceOf = (customer: string) => balances.get(customer) ?? 0;
   const standing = (balance: number) => ({
@@ -355,26 +347,14 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
           "stripe_not_configured",
           "this product has no Stripe configuration",
         );
-      // The same key and body return the same link; another body under the
-      // key is idempotency_conflict.
-      const key = id(request.headers.get("idempotency-key"), "Idempotency-Key");
-      const transport = canonical({ route: "topup.session", customer, input });
-      const replay = requestKeys.get(key);
-      if (replay) {
-        if (replay.request !== transport)
-          throw new Refusal(
-            409,
-            "idempotency_conflict",
-            "this Idempotency-Key was used with different content",
-          );
-        return { status: 201, body: replay.result };
-      }
-      const result = {
-        url: `${ORIGIN}/topup/ts_${hex()}`,
-        expires_at: new Date(now() + 30 * 60_000).toISOString(),
+      // Every call opens a new link; an extra one has no side effect.
+      return {
+        status: 201,
+        body: {
+          url: `${ORIGIN}/topup/ts_${hex()}`,
+          expires_at: new Date(now() + 30 * 60_000).toISOString(),
+        },
       };
-      requestKeys.set(key, { request: transport, result });
-      return { status: 201, body: result };
     }
     if (action === "POST checkouts") {
       const input = await body(request);
@@ -396,7 +376,7 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
           ].includes(key)
         )
           invalid("unexpected_field", `unknown field ${key}`);
-      const { offer_version, ...rest } = input;
+      const { offer_version } = input;
       if (offer_version !== undefined) id(offer_version, "offer_version");
       const ref = id(input.purchase_ref, "purchase_ref");
       if (
@@ -427,35 +407,26 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
           "return_origin_not_configured",
           "return_path needs the product's return origin configured",
         );
-      const key = id(request.headers.get("idempotency-key"), "Idempotency-Key");
-      const transport = canonical({
-        customer,
-        input: rest,
-        ...(offer_version === undefined ? {} : { quote: offer_version }),
-      });
-      const replay = requestKeys.get(key);
-      if (replay) {
-        if (replay.request !== transport)
-          throw new Refusal(
-            409,
-            "idempotency_conflict",
-            "this Idempotency-Key was used with different content",
-          );
-        return { status: 201, body: receipt(replay.result) };
-      }
-      const remember = (result: unknown) => {
-        requestKeys.set(key, { request: transport, result });
-        return { status: 201, body: receipt(result) };
-      };
+      // The purchase is named by (customer, purchase_ref): a retry answers its
+      // order as it is now, and a refused purchase_ref stays refused.
       let order = orders.find(
         (o) => o.customer === customer && o.purchase_ref === ref,
       );
       if (order && input.sku !== order.sku)
         invalid("unsupported_sku", "a purchase_ref keeps its original sku");
+      const refusalKey = canonical([customer, ref]);
+      const refused = order ? undefined : refusals.get(refusalKey);
+      if (refused !== undefined)
+        return { status: 201, body: { state: "rejected", reason: refused } };
       if (!order && offer_version !== undefined) {
         const current = offers.find((o) => o.sku === input.sku);
-        if (!current || current.offer_version !== offer_version)
-          return remember({ state: "rejected", reason: "offer_changed" });
+        if (!current || current.offer_version !== offer_version) {
+          refusals.set(refusalKey, "offer_changed");
+          return {
+            status: 201,
+            body: { state: "rejected", reason: "offer_changed" },
+          };
+        }
       }
       if (!order) {
         const offer = offers.find((o) => o.sku === input.sku);
@@ -498,7 +469,14 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
         };
         orders.push(order);
       }
-      return remember({ order_id: order.id });
+      return {
+        status: 201,
+        body: {
+          order_id: order.id,
+          state: order.state,
+          checkout_url: order.checkout_url,
+        },
+      };
     }
     if (action === "GET orders") {
       const cursor = url.searchParams.get("cursor");

@@ -4,7 +4,7 @@ Billing 产品接口（API v1）的客户端，以及给产品自己写测试用
 
 模型是**先用后报**：开始工作前读一次余额，执行中按间隔上报已经发生的用量，余额用尽时 Billing 告诉你停下。超支最多一个上报间隔，下一次充值先抵扣。
 
-- `@flyresearch/billing-sdk`：零依赖、只用 `fetch` 的客户端和 `createMeter`。Node 20+、Bun、Deno、Cloudflare Workers 都能用（需要全局 `crypto.subtle`，Node 18 要加 `--experimental-global-webcrypto`）。
+- `@flyresearch/billing-sdk`：零依赖、只用 `fetch` 的客户端和 `createMeter`。Node 18+、Bun、Deno、Cloudflare Workers 都能用。
 - `@flyresearch/billing-sdk/testing`：内存假服务，按公开接口的规则行为。
 - `@flyresearch/billing-sdk/contract`：契约测试。同一套测试在这里对假服务跑，在 Billing 服务仓库里对真服务跑，保证两者一致。
 
@@ -16,19 +16,23 @@ bun add github:flyresearch/billing-sdk#v0.5.0
 
 源码是 TypeScript，直接被 Bun、Deno 和 Workers 的打包器使用。`v0.1.x` 是旧接口（冻结与结算）。`v0.3` 起错误码与 Billing 服务一致：输入不合法是 422 加具体错误码（如 `invalid_integer`、`invalid_identifier`），未配置收款是 503 `stripe_not_configured`，订单完成状态为 `fulfilled`。
 
+**v0.6 的不兼容变化**：客户端不再发送 `Idempotency-Key`，Billing 也不再读它。`checkout(customer, input, key?)` 与 `createTopupSession(customer, options, key?)` 去掉了第三个参数（key），`409 idempotency_conflict` 不再出现。重试由请求本身识别，不需要另配幂等键：用量看 `event_id`，建单看（客户，`purchase_ref`）。充值链接每次调用都是新的，同一个 key 不再返回同一个链接。
+
 ## 接口
 
 | 方法                                                    | 作用                                                  |
 | ------------------------------------------------------- | ----------------------------------------------------- |
 | `balance(customer)`                                     | `{ balance, allowed }`；`allowed` 为 false 就不开始   |
-| `reportUsage(customer, { event_id, units, metadata? })` | 上报已发生的用量。`event_id` 即幂等键，重发不重复扣费 |
+| `reportUsage(customer, { event_id, units, metadata? })` | 上报已发生的用量。按 `event_id` 识别，重发不重复扣费   |
 | `history(customer, { cursor?, type? })`                 | 充值、用量、退款、调账记录                            |
 | `catalog()`                                             | 在售额度包（固定档与自定金额档）和收款方式            |
 | `checkout(customer, { sku, purchase_ref, ... })`        | 在产品自己的购买页建单；同一 `purchase_ref` 只建一单  |
 | `order(customer, id)` / `orders(customer)`              | 订单状态与 `checkout_url`，付款结果以它和余额为准     |
-| `createTopupSession(customer, { return_path? })`        | 托管充值页链接（30 分钟有效）：不想自己画购买页时用   |
+| `createTopupSession(customer, { return_path? })`        | 托管充值页链接（30 分钟有效），每次调用都是新链接     |
 
 客户 ID 由你的产品定义，第一次出现时自动建立。金额和额度都是十进制整数字符串。
+
+重试是安全的，靠的是请求里的业务标识，而不是请求头：用量按 `event_id`，建单按（客户，`purchase_ref`），响应丢失后原样重发即可。充值链接多建一个没有副作用，直接再调用。
 
 ## 用法
 
@@ -77,7 +81,7 @@ if (receipt.state !== "rejected" && receipt.checkout_url)
   redirect(receipt.checkout_url); // 建单当场返回收银台地址
 ```
 
-建单当场返回收银台地址（HTTP 201）。Stripe 暂时不可用时返回 503：用同一个 `purchase_ref` 重试，会拿到同一个订单和同一个收银台，不会建第二单；同一个 `purchase_ref` 重发总是返回该订单的当前状态。回跳页面不是付款凭证：回来后读 `order()` 的 `state`（`fulfilled` 即已到账）和余额。回执是 `offer_changed` 时这次购买已终结，用户重新确认价格后换一个新的 `purchase_ref`。自定金额档传 `amount`（最小货币单位），额度 = 金额 × `credits_per_unit`。
+建单当场返回收银台地址（HTTP 201）。Stripe 暂时不可用时返回 503：用同一个 `purchase_ref` 重试，会拿到同一个订单和同一个收银台，不会建第二单；同一个 `purchase_ref` 重发总是返回该订单的当前状态。回跳页面不是付款凭证：回来后读 `order()` 的 `state`（`fulfilled` 即已到账）和余额。回执是 `offer_changed` 时这次购买已终结：这个拒绝按（客户，`purchase_ref`）保存，之后用同一个 `purchase_ref` 重发（哪怕带上新的 `offer_version`）也只会得到同一个拒绝。用户重新确认价格后换一个新的 `purchase_ref`。自定金额档传 `amount`（最小货币单位），额度 = 金额 × `credits_per_unit`。
 
 ## 测试
 

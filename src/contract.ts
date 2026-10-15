@@ -244,23 +244,17 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       );
     });
 
-    test("a top-up key replays its link; another body under it is idempotency_conflict", async () => {
+    test("every top-up session call opens a new link", async () => {
       const { client } = await world({ returnOrigin: "https://product.test" });
-      const link = await client.createTopupSession("u", {}, "topup-1");
-      expect(await client.createTopupSession("u", {}, "topup-1")).toEqual(link);
+      const first = await client.createTopupSession("u");
+      const second = await client.createTopupSession("u");
+      expect(second.url).not.toBe(first.url);
+      const routed = await client.createTopupSession("u", {
+        return_path: "/billing",
+      });
       expect(
-        await code(
-          client.createTopupSession(
-            "u",
-            { return_path: "/billing" },
-            "topup-1",
-          ),
-        ),
-      ).toBe("409 idempotency_conflict");
-      expect(await code(client.createTopupSession("v", {}, "topup-1"))).toBe(
-        "409 idempotency_conflict",
-      );
-      expect(await client.createTopupSession("u")).not.toEqual(link);
+        await client.createTopupSession("u", { return_path: "/billing" }),
+      ).not.toEqual(routed);
     });
 
     test("a debt is paid off by the next purchase", async () => {
@@ -434,16 +428,17 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       expect(receipt).toMatchObject({ state: "awaiting_payment" });
       if (!("order_id" in receipt)) throw new Error("expected an order");
       expect(typeof receipt.checkout_url).toBe("string");
-      // A retry, by key or by purchase_ref alone, names the same order.
+      // A retry under the same purchase_ref names the same order and checkout.
       expect(
         await client.checkout("u", { sku: "pack-100", purchase_ref: "p1" }),
-      ).toMatchObject({ order_id: receipt.order_id });
+      ).toEqual(receipt);
+      // Other fields may differ on a retry; the purchase_ref still names it.
       expect(
-        await client.checkout(
-          "u",
-          { sku: "pack-100", purchase_ref: "p1" },
-          "another-key",
-        ),
+        await client.checkout("u", {
+          sku: "pack-100",
+          purchase_ref: "p1",
+          payment_method: "card",
+        }),
       ).toMatchObject({ order_id: receipt.order_id });
       const order = await client.order("u", receipt.order_id);
       expect(order).toMatchObject({
@@ -484,7 +479,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       });
     });
 
-    test("the default checkout key fits any customer and purchase_ref", async () => {
+    test("checkout dedupes a long, non-ASCII customer and purchase_ref", async () => {
       const { client } = await world(packs);
       const customer = `用户-${"x".repeat(180)}`;
       const ref = "r".repeat(190);
@@ -516,35 +511,22 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       });
     });
 
-    test("checkout refusals: changed key content, changed sku, stale quote, bad amounts", async () => {
+    test("checkout refusals: changed sku, stale quote, bad amounts", async () => {
       const { client } = await world(packs);
-      await client.checkout(
-        "u",
-        { sku: "pack-100", purchase_ref: "p1" },
-        "my-key-1",
-      );
+      await client.checkout("u", { sku: "pack-100", purchase_ref: "p1" });
       expect(
         await code(
-          client.checkout(
-            "u",
-            { sku: "custom", purchase_ref: "p1", amount: "1000" },
-            "my-key-1",
-          ),
-        ),
-      ).toBe("409 idempotency_conflict");
-      expect(
-        await code(
-          client.checkout(
-            "u",
-            { sku: "custom", purchase_ref: "p1", amount: "1000" },
-            "k2",
-          ),
+          client.checkout("u", {
+            sku: "custom",
+            purchase_ref: "p1",
+            amount: "1000",
+          }),
         ),
       ).toBe("422 unsupported_sku");
       expect(
         await code(client.checkout("u", { sku: "nope", purchase_ref: "p2" })),
       ).toBe("422 unsupported_sku");
-      // A stale quote is a definitive refusal under its key, not an error.
+      // A stale quote is a definitive refusal of the purchase, not an error.
       expect(
         await client.checkout("u", {
           sku: "pack-100",
@@ -553,6 +535,19 @@ export function contractSuite(name: string, create: CreateTestBilling) {
         }),
       ).toEqual({ state: "rejected", reason: "offer_changed" });
       const version = (await client.catalog()).offers[0]!.offer_version;
+      // A refused purchase_ref stays refused, even with the current quote or
+      // none; the payer confirms again under a new purchase_ref.
+      for (const retry of [{ offer_version: version }, {}])
+        expect(
+          await client.checkout("u", {
+            sku: "pack-100",
+            purchase_ref: "p3",
+            ...retry,
+          }),
+        ).toEqual({ state: "rejected", reason: "offer_changed" });
+      expect((await client.orders("u")).data.map((o) => o.purchase_ref)).toEqual(
+        ["p1"],
+      );
       expect(
         await client.checkout("u", {
           sku: "pack-100",

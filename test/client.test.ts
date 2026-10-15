@@ -191,3 +191,20 @@ test("a refused key (401) keeps the batch for retry under the same event id", as
   await meter.close();
   expect(sent).toEqual(["s:1", "s:1"]);
 });
+
+test("no request carries an Idempotency-Key", async () => {
+  const headers: Headers[] = [];
+  const client = createBillingClient({
+    baseUrl: "https://billing.test",
+    apiKey: "k",
+    fetch: (async (_input: string | URL | Request, init?: RequestInit) => {
+      headers.push(new Headers(init?.headers));
+      return Response.json({});
+    }) as unknown as typeof fetch,
+  });
+  await client.checkout("u", { sku: "s", purchase_ref: "p" });
+  await client.createTopupSession("u");
+  await client.reportUsage("u", { event_id: "e", units: "1" });
+  expect(headers).toHaveLength(3);
+  expect(headers.every((h) => !h.has("idempotency-key"))).toBe(true);
+});

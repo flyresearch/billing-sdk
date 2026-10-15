@@ -1,5 +1,8 @@
 // Billing 产品接口（API v1，ADR-0014）的客户端。零依赖，只用 fetch，
-// Node 20+（需要全局 crypto.subtle）、Bun、Deno、Cloudflare Workers 都能用。
+// Node 18+、Bun、Deno、Cloudflare Workers 都能用。
+//
+// 不发送 Idempotency-Key：Billing 按请求指向的对象识别重试。用量看 event_id，
+// 建单看（客户，purchase_ref），响应丢失后用相同请求重发即可。
 //
 // 模型：先用后报。开始前读一次余额（allowed 为 false 就不开始）；执行中按固定
 // 间隔上报已发生的用量；响应里 allowed 变成 false 就结束。用 createMeter 即可。
@@ -122,25 +125,11 @@ export class BillingError extends Error {
   }
 }
 
-// The default checkout key: one per customer and purchase_ref, of fixed length
-// and plain ASCII whatever the IDs are (the service caps keys at 200 characters,
-// and HTTP headers take no arbitrary Unicode).
-async function checkoutKey(customer: string, purchaseRef: string) {
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(`${customer}\n${purchaseRef}`),
-  );
-  return `checkout:${[...new Uint8Array(digest)]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("")}`;
-}
-
 export function createBillingClient(config: BillingConfig) {
   const call = async <T>(
     method: "GET" | "POST",
     path: string,
     body?: unknown,
-    idempotencyKey?: string,
   ): Promise<T> => {
     const send = config.fetch ?? fetch;
     const response = await send(new URL(path, config.baseUrl), {
@@ -148,9 +137,6 @@ export function createBillingClient(config: BillingConfig) {
       headers: {
         authorization: `Bearer ${config.apiKey}`,
         ...(body === undefined ? {} : { "content-type": "application/json" }),
-        ...(idempotencyKey === undefined
-          ? {}
-          : { "idempotency-key": idempotencyKey }),
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
@@ -202,39 +188,30 @@ export function createBillingClient(config: BillingConfig) {
 
     /**
      * 托管充值页链接（30 分钟有效）。把用户的浏览器送过去，付完回到产品的
-     * return_path（需要在控制台配置回跳站点）。同一个 key 同样参数重发返回同一个
-     * 链接；不传则每次新建。
+     * return_path（需要在控制台配置回跳站点）。每次调用都返回一个新链接；
+     * 多建一个没有副作用，响应丢失时直接再调用即可。
      */
-    createTopupSession: (
-      id: string,
-      options: { return_path?: string } = {},
-      key: string = crypto.randomUUID(),
-    ) =>
+    createTopupSession: (id: string, options: { return_path?: string } = {}) =>
       call<{ url: string; expires_at: string }>(
         "POST",
         `${customer(id)}/topup-sessions`,
         options,
-        key,
       ),
 
     /** 在售额度包与收款方式，自建购买页用 */
     catalog: () => call<Catalog>("GET", "/v1/catalog"),
 
     /**
-     * 自建购买页建单。purchase_ref 先存进产品自己的库再调用；重试用同一个
-     * purchase_ref（幂等键默认由客户和它派生），不会建第二单。回执是
-     * offer_changed 时这次购买已终结：用户重新确认后换一个新的 purchase_ref。
+     * 自建购买页建单。purchase_ref 先存进产品自己的库再调用；Billing 按（客户，
+     * purchase_ref）识别这次购买，重试用同一个 purchase_ref，不会建第二单。回执是
+     * offer_changed 时这次购买已终结，这个 purchase_ref 之后重发也只会得到同一个
+     * 拒绝：用户重新确认后换一个新的 purchase_ref。
      * 结果里直接带 checkout_url，把浏览器送过去即可；503 时用同一个 purchase_ref
      * 重试，会拿到同一个订单与同一个收银台。付款结果以 order() 和余额为准，
      * 回跳页面不是付款凭证。
      */
-    checkout: async (id: string, input: CheckoutInput, key?: string) =>
-      call<CheckoutReceipt>(
-        "POST",
-        `${customer(id)}/checkouts`,
-        input,
-        key ?? (await checkoutKey(id, input.purchase_ref)),
-      ),
+    checkout: (id: string, input: CheckoutInput) =>
+      call<CheckoutReceipt>("POST", `${customer(id)}/checkouts`, input),
 
     /** 一个订单的当前状态 */
     order: (id: string, orderId: string) =>
