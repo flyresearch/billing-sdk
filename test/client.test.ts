@@ -208,3 +208,83 @@ test("no request carries an Idempotency-Key", async () => {
   expect(headers).toHaveLength(3);
   expect(headers.every((h) => !h.has("idempotency-key"))).toBe(true);
 });
+
+test("the fake simulates a subscription: checkout, payment, a charged switch, a free switch back, renewal and cancellation", async () => {
+  const { createTestBilling } = await import("../src/testing");
+  let at = Date.UTC(2026, 0, 10);
+  const billing = await createTestBilling({
+    now: () => at,
+    plans: [
+      { sku: "free", price: "0", credits: "100" },
+      { sku: "starter", price: "990", credits: "1000" },
+      { sku: "pro", price: "4990", credits: "5000" },
+    ],
+  });
+  const client = createBillingClient({
+    ...billing.config,
+    fetch: billing.fetch,
+  });
+  const code = (p: Promise<unknown>) =>
+    p.then(
+      () => "accepted",
+      (e: BillingError) => `${e.status} ${e.code}`,
+    );
+  expect((await client.plan("u")).plan?.sku).toBe("free");
+  const receipt = await client.subscriptionCheckout("u", {
+    plan_sku: "starter",
+    purchase_ref: "r1",
+  });
+  expect(receipt.state).toBe("checkout");
+  expect(receipt.checkout_url).toStartWith("https://");
+  // The same purchase_ref answers the same subscription.
+  expect(
+    (
+      await client.subscriptionCheckout("u", {
+        plan_sku: "starter",
+        purchase_ref: "r1",
+      })
+    ).subscription_id,
+  ).toBe(receipt.subscription_id);
+  await billing.paySubscription(receipt.subscription_id);
+  let view = await client.plan("u");
+  expect(view.plan?.sku).toBe("starter");
+  expect(view.subscription?.current_period_end).toBe(
+    "2026-02-10T00:00:00.000Z",
+  );
+  expect(view.allowance?.total).toBe("1000");
+  expect(
+    await code(
+      client.subscriptionCheckout("u", { plan_sku: "pro", purchase_ref: "r2" }),
+    ),
+  ).toBe("409 subscription_exists");
+  // Up: charged, topped up to pro's credits. Down and back up: free.
+  expect((await client.changePlan("u", "pro")).allowance?.total).toBe("5000");
+  await client.changePlan("u", "starter");
+  expect((await client.changePlan("u", "pro")).allowance?.total).toBe("5000");
+  expect(await code(client.changePlan("u", "pro"))).toBe("409 plan_unchanged");
+  // Renewal: the next period's credits; the last period's left expire.
+  at = Date.UTC(2026, 1, 10, 1);
+  view = await client.plan("u");
+  expect(view.subscription?.current_period_end).toBe(
+    "2026-03-10T00:00:00.000Z",
+  );
+  expect(view.allowance).toEqual({
+    total: "5000",
+    remaining: "5000",
+    expires_at: "2026-03-10T00:00:00.000Z",
+  });
+  expect(
+    (await client.cancelPlan("u")).subscription?.cancel_at_period_end,
+  ).toBe(true);
+  expect(
+    (await client.resumePlan("u")).subscription?.cancel_at_period_end,
+  ).toBe(false);
+  await client.cancelPlan("u");
+  expect((await client.billingPortal("u")).url).toStartWith("https://");
+  // After the period: back on the free plan.
+  at = Date.UTC(2026, 2, 10, 1);
+  view = await client.plan("u");
+  expect(view.plan?.sku).toBe("free");
+  expect(view.subscription).toBeNull();
+  expect(await code(client.cancelPlan("u"))).toBe("409 subscription_required");
+});

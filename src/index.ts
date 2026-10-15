@@ -1,4 +1,4 @@
-// Billing 产品接口（API v1，ADR-0014）的客户端。零依赖，只用 fetch，
+// Billing 产品接口（API v1，ADR-0014、ADR-0015）的客户端。零依赖，只用 fetch，
 // Node 18+、Bun、Deno、Cloudflare Workers 都能用。
 //
 // 不发送 Idempotency-Key：Billing 按请求指向的对象识别重试。用量看 event_id，
@@ -10,6 +10,11 @@
 // 充值两条路：createTopupSession 把用户送到 Billing 托管的充值页（省事）；或者
 // 在产品自己的界面里用 catalog 列出额度包、checkout 建单、order 读结果（交互与
 // UI 和产品统一）。
+//
+// 订阅档位（ADR-0015）：plan 读用户当前档位、权益和本期月度额度；月度额度先于
+// 额度包使用，期末作废、不结转。付费档用 subscriptionCheckout 开通，changePlan
+// 换档，cancelPlan / resumePlan 到期取消与撤销，billingPortal 打开 Stripe 客户
+// 管理页。托管充值页也能完成这些操作。
 
 export interface BillingConfig {
   /** 服务地址，例如 https://billkernel.com */
@@ -35,7 +40,8 @@ export interface UsageResult extends Standing {
 
 export interface HistoryEntry {
   id: string;
-  type: "purchase" | "usage" | "refund" | "adjustment";
+  /** 月度额度发放记为 adjustment（note 为 "allowance"），期末作废记为 expiry */
+  type: "purchase" | "usage" | "refund" | "adjustment" | "expiry";
   /** 正数为增加，负数为扣减 */
   credits: string;
   balance_after: string;
@@ -66,9 +72,62 @@ export interface Offer {
   step?: string;
 }
 
+/** 档位（ADR-0015）。价格是最小货币单位的整数字符串，"0" 即免费档 */
+export interface Plan {
+  sku: string;
+  name: string;
+  /** 每月价格 */
+  price: string;
+  currency: string;
+  /** 每期发放的月度额度 */
+  credits: string;
+  /** 产品自己定义的权益对象，Billing 原样返回；限流等由产品执行 */
+  entitlements: Record<string, unknown>;
+}
+
+/** 用户当前的档位、订阅与本期月度额度 */
+export interface CustomerPlan {
+  /** 有效订阅的档位，否则免费档；都没有时为 null */
+  plan: Plan | null;
+  /** 本期结束：订阅的计费周期结束，免费档为下月 1 日 00:00 UTC */
+  period_end: string | null;
+  /** 本期月度额度；尚未发放时为 null */
+  allowance: { total: string; remaining: string; expires_at: string } | null;
+  subscription: {
+    id: string;
+    status: "active" | "trialing" | "past_due";
+    /** 已设为到期取消 */
+    cancel_at_period_end: boolean;
+    current_period_end: string;
+  } | null;
+}
+
+export interface SubscriptionCheckoutInput {
+  plan_sku: string;
+  /** 产品自己的购买引用；重试用同一个，得到同一个订阅 */
+  purchase_ref: string;
+  /** 付完回到产品的路径（需要在控制台配置回跳站点） */
+  return_path?: string;
+}
+
+/**
+ * 开通结果（HTTP 201）。state 为 checkout 时把浏览器送到 checkout_url（只收银行
+ * 卡，1 小时内有效）；checkout_url 为 null 表示上次没拿到 Stripe 的回答，用同一个
+ * purchase_ref 重试。付款后档位经 Webhook 生效，以 plan() 为准。
+ */
+export interface SubscriptionReceipt {
+  subscription_id: string;
+  plan_sku: string;
+  /** checkout、checkout_expired，或付款后 Stripe 订阅的状态 */
+  state: string;
+  checkout_url: string | null;
+}
+
 export interface Catalog {
   /** 按上架顺序；没有配置收款时为空 */
   offers: Offer[];
+  /** 在售档位，按价格从低到高 */
+  plans: Plan[];
   /** 产品开通的收款方式，如 card、alipay、wechat_pay */
   payment_methods: string[];
 }
@@ -219,6 +278,45 @@ export function createBillingClient(config: BillingConfig) {
         "GET",
         `${customer(id)}/orders/${encodeURIComponent(orderId)}`,
       ),
+
+    /**
+     * 当前档位、权益与本期月度额度。和查余额一样，读取时先作废到期的额度，
+     * 再按需发放本月免费档额度。权益可以缓存几分钟。
+     */
+    plan: (id: string) => call<CustomerPlan>("GET", `${customer(id)}/plan`),
+
+    /**
+     * 开通付费档：返回订阅收银台地址。已有订阅时 409 subscription_exists（改用
+     * changePlan）；免费档或已下架档位 422。
+     */
+    subscriptionCheckout: (id: string, input: SubscriptionCheckoutInput) =>
+      call<SubscriptionReceipt>(
+        "POST",
+        `${customer(id)}/subscription-checkouts`,
+        input,
+      ),
+
+    /**
+     * 换档，立即生效。新档价格高于本期已付过的档位时，立即按剩余天数扣差价并补发
+     * 额度差（扣款失败 409 plan_change_payment_failed，档位不变）；其余换档不扣款
+     * 不退款，下期按新档。另一次换档未完成时 409 plan_change_in_progress。
+     */
+    changePlan: (id: string, planSku: string) =>
+      call<CustomerPlan>("POST", `${customer(id)}/plan`, {
+        plan_sku: planSku,
+      }),
+
+    /** 到期取消：本期照常使用，结束后回到免费档 */
+    cancelPlan: (id: string) =>
+      call<CustomerPlan>("POST", `${customer(id)}/plan/cancel`, {}),
+
+    /** 撤销到期取消 */
+    resumePlan: (id: string) =>
+      call<CustomerPlan>("POST", `${customer(id)}/plan/resume`, {}),
+
+    /** Stripe 客户管理页链接（换卡、发票、取消），之后回到产品 */
+    billingPortal: (id: string, options: { return_path?: string } = {}) =>
+      call<{ url: string }>("POST", `${customer(id)}/billing-portal`, options),
 
     /** 这个客户的订单，新的在前 */
     orders: (id: string, options: { cursor?: string } = {}) =>

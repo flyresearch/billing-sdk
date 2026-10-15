@@ -4,6 +4,11 @@
 // 在 Billing 仓库里对真服务跑。不覆盖托管充值页、Stripe 与管理端：建单得到的
 // checkout_url 不能打开，付款用 payOrder() 模拟。
 //
+// 档位（ADR-0015）：免费档每个自然月（UTC）在第一次读写时发放，先于其他额度
+// 使用，月底作废（契约测试覆盖）。订阅是简化模拟、不在契约内：开通后用
+// paySubscription() 模拟首期付款，每期到期自动续费并发放下一期额度（除非已设到期
+// 取消），换档、取消、客户管理页按公开接口的规则回答。
+//
 //   const billing = await createTestBilling();
 //   const client = createBillingClient({ ...billing.config, fetch: billing.fetch });
 //   billing.grant("user_1", "1000");
@@ -29,9 +34,23 @@ export type TestOffer =
       amount: string;
     };
 
+/** 测试用档位；price 为 "0" 即免费档（至多一个） */
+export interface TestPlan {
+  sku: string;
+  name?: string;
+  /** 每月价格，最小货币单位 */
+  price: string;
+  currency?: string;
+  /** 每期额度 */
+  credits: string;
+  entitlements?: Record<string, unknown>;
+}
+
 export interface TestBillingOptions {
   /** 在售额度包，按顺序；默认没有。payments 为 false 时 catalog 不列出 */
   offers?: TestOffer[];
+  /** 在售档位；默认没有 */
+  plans?: TestPlan[];
   /** 每单位用量扣多少额度，默认 1 */
   creditsPerUnit?: number;
   /** 是否已配置收款，默认 true；false 时建充值链接返回 503 stripe_not_configured */
@@ -60,6 +79,12 @@ export interface TestBilling {
 export type CreateTestBilling = (
   options?: TestBillingOptions,
 ) => Promise<TestBilling>;
+
+/** 内存假服务独有的订阅模拟（真服务的订阅经 Stripe，不在契约内） */
+export interface FakeBilling extends TestBilling {
+  /** 模拟订阅收银台付款成功：订阅生效，发放首期额度 */
+  paySubscription(subscriptionId: string): Promise<void>;
+}
 
 const ORIGIN = "https://billing.test";
 const PAGE = 50;
@@ -122,7 +147,7 @@ interface Entry {
   seq: number;
   id: string;
   customer: string;
-  type: "purchase" | "usage" | "refund" | "adjustment";
+  type: "purchase" | "usage" | "refund" | "adjustment" | "expiry";
   credits: number;
   balance_after: number;
   created_at: string;
@@ -149,7 +174,35 @@ interface TestOrder {
   fulfilled_at: string | null;
 }
 
-export const createTestBilling: CreateTestBilling = async (options = {}) => {
+interface Allowance {
+  key: string;
+  total: number;
+  remaining: number;
+  expires_at: string;
+  subscription?: string;
+}
+interface Subscription {
+  id: string;
+  customer: string;
+  purchase_ref: string;
+  plan_sku: string;
+  state: "checkout" | "active" | "canceled" | "checkout_expired";
+  cancel_at_period_end: boolean;
+  period_end: string | null;
+  checkout_url: string;
+  /** 本期已付过的档位：升回其中之一不再扣款 */
+  paid: string[];
+}
+// The same day of the next month, in UTC (as a monthly Stripe period).
+const nextMonth = (at: string) => {
+  const d = new Date(at);
+  d.setUTCMonth(d.getUTCMonth() + 1);
+  return d.toISOString();
+};
+
+export const createTestBilling = async (
+  options: TestBillingOptions = {},
+): Promise<FakeBilling> => {
   const now = options.now ?? Date.now;
   const iso = () => new Date(now()).toISOString();
   const apiKey = `bk_test_${hex()}`;
@@ -169,6 +222,20 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
   // a refused purchase_ref never creates an order.
   const refusals = new Map<string, string>();
   const publicOrder = ({ seq: _, customer: __, ...order }: TestOrder) => order;
+
+  const plans = (options.plans ?? [])
+    .map((plan) => ({
+      sku: plan.sku,
+      name: plan.name ?? plan.sku,
+      price: plan.price,
+      currency: plan.currency ?? "usd",
+      credits: plan.credits,
+      entitlements: plan.entitlements ?? {},
+    }))
+    .sort((a, b) => Number(BigInt(a.price) - BigInt(b.price)));
+  const free = plans.find((plan) => plan.price === "0") ?? null;
+  const allowances = new Map<string, Allowance[]>();
+  const subscriptions: Subscription[] = [];
 
   const balanceOf = (customer: string) => balances.get(customer) ?? 0;
   const standing = (balance: number) => ({
@@ -195,6 +262,156 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
     });
     return balance;
   }
+
+  // A monthly allowance: it repays debt first, like any credit, and only
+  // what is left of it can be spent or expire.
+  function grantAllowance(
+    customer: string,
+    allowance: Omit<Allowance, "remaining">,
+  ) {
+    const list = allowances.get(customer) ?? [];
+    if (list.some((a) => a.key === allowance.key)) return;
+    const debt = Math.max(0, -balanceOf(customer));
+    append(customer, "adjustment", allowance.total, { note: "allowance" });
+    list.push({
+      ...allowance,
+      remaining: allowance.total - Math.min(allowance.total, debt),
+    });
+    allowances.set(customer, list);
+  }
+  const activeSubscription = (customer: string) =>
+    subscriptions.find((s) => s.customer === customer && s.state === "active");
+  // Before anything reads or changes a customer: renew or end subscriptions
+  // whose period ended, expire what is due, then grant the month's free
+  // allowance when no subscription is active.
+  function touch(customer: string) {
+    const at = iso();
+    const sub = activeSubscription(customer);
+    while (sub && sub.state === "active" && sub.period_end! <= at) {
+      if (sub.cancel_at_period_end) sub.state = "canceled";
+      else {
+        sub.period_end = nextMonth(sub.period_end!);
+        sub.paid = [sub.plan_sku];
+        const plan = plans.find((p) => p.sku === sub.plan_sku)!;
+        if (sub.period_end > at)
+          grantAllowance(customer, {
+            key: `invoice.${sub.id}.${sub.period_end}`,
+            total: Number(plan.credits),
+            expires_at: sub.period_end,
+            subscription: sub.id,
+          });
+      }
+    }
+    for (const allowance of allowances.get(customer) ?? [])
+      if (allowance.expires_at <= at && allowance.remaining > 0) {
+        append(customer, "expiry", -allowance.remaining);
+        allowance.remaining = 0;
+      }
+    if (free && !activeSubscription(customer)) {
+      const d = new Date(now());
+      grantAllowance(customer, {
+        key: `free.${at.slice(0, 7)}`,
+        total: Number(free.credits),
+        expires_at: new Date(
+          Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1),
+        ).toISOString(),
+      });
+    }
+  }
+  // Usage spends monthly allowances first, soonest expiry first.
+  function spendAllowances(customer: string, credits: number) {
+    const list = [...(allowances.get(customer) ?? [])].sort((a, b) =>
+      a.expires_at < b.expires_at ? -1 : a.expires_at > b.expires_at ? 1 : 0,
+    );
+    for (const allowance of list) {
+      const take = Math.min(allowance.remaining, credits);
+      allowance.remaining -= take;
+      credits -= take;
+    }
+  }
+  function planView(customer: string) {
+    touch(customer);
+    const sub = activeSubscription(customer);
+    const plan = sub ? plans.find((p) => p.sku === sub.plan_sku)! : free;
+    const periodEnd = sub
+      ? sub.period_end
+      : free
+        ? new Date(
+            Date.UTC(
+              new Date(now()).getUTCFullYear(),
+              new Date(now()).getUTCMonth() + 1,
+              1,
+            ),
+          ).toISOString()
+        : null;
+    const current = (allowances.get(customer) ?? []).filter((a) =>
+      sub
+        ? a.subscription === sub.id && a.expires_at === sub.period_end
+        : !a.subscription && a.expires_at === periodEnd,
+    );
+    return {
+      plan,
+      period_end: periodEnd,
+      allowance: current.length
+        ? {
+            total: String(current.reduce((n, a) => n + a.total, 0)),
+            remaining: String(current.reduce((n, a) => n + a.remaining, 0)),
+            expires_at: periodEnd,
+          }
+        : null,
+      subscription: sub
+        ? {
+            id: sub.id,
+            status: "active",
+            cancel_at_period_end: sub.cancel_at_period_end,
+            current_period_end: sub.period_end,
+          }
+        : null,
+    };
+  }
+  function paidPlan(sku: unknown) {
+    const plan = plans.find((p) => p.sku === id(sku, "plan_sku"));
+    if (!plan) invalid("unsupported_plan", "no such plan on sale");
+    if (plan!.price === "0")
+      invalid(
+        "free_plan_not_subscribable",
+        "the free plan needs no subscription",
+      );
+    return plan!;
+  }
+  const fields = (input: Record<string, unknown>, allowed: string[]) => {
+    for (const key of Object.keys(input))
+      if (!allowed.includes(key))
+        invalid("unexpected_field", `unknown field ${key}`);
+  };
+  const returnPath = (path: unknown) => {
+    if (
+      path !== undefined &&
+      (typeof path !== "string" ||
+        path.length < 1 ||
+        path.length > 512 ||
+        !path.startsWith("/") ||
+        path.startsWith("//") ||
+        path.includes("\\") ||
+        path.includes("#"))
+    )
+      invalid(
+        "invalid_return_path",
+        "return_path must be a path starting with /",
+      );
+    if (path !== undefined && !options.returnOrigin)
+      invalid(
+        "return_origin_not_configured",
+        "return_path needs the product's return origin configured",
+      );
+  };
+  const notConfigured = () => {
+    throw new Refusal(
+      503,
+      "stripe_not_configured",
+      "this product has no Stripe configuration",
+    );
+  };
 
   async function body(request: Request): Promise<Record<string, unknown>> {
     const text = await request.text();
@@ -244,13 +461,15 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
                 amount_decimals: decimals(offer.currency),
               }))
             : [],
+          plans,
           payment_methods: payments ? ["card"] : [],
         },
       };
     if (
       parts[0] !== "v1" ||
       parts[1] !== "customers" ||
-      (parts.length !== 4 && !(parts.length === 5 && parts[3] === "orders"))
+      (parts.length !== 4 &&
+        !(parts.length === 5 && ["orders", "plan"].includes(parts[3]!)))
     )
       throw new Refusal(404, "not_found", "no such route");
     const customer = id(parts[2], "customer");
@@ -261,9 +480,120 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
       if (!order) throw new Refusal(404, "not_found", "no such order");
       return { status: 200, body: publicOrder(order) };
     }
-    const action = `${request.method} ${parts[3]}`;
-    if (action === "GET balance")
+    const action = `${request.method} ${parts.slice(3).join("/")}`;
+    if (action === "GET balance") {
+      touch(customer);
       return { status: 200, body: standing(balanceOf(customer)) };
+    }
+    if (action === "GET plan") return { status: 200, body: planView(customer) };
+    if (action === "POST subscription-checkouts") {
+      const input = await body(request);
+      fields(input, ["plan_sku", "purchase_ref", "return_path"]);
+      const ref = id(input.purchase_ref, "purchase_ref");
+      returnPath(input.return_path);
+      if (!payments) notConfigured();
+      const previous = subscriptions.find(
+        (s) => s.customer === customer && s.purchase_ref === ref,
+      );
+      let sub = previous;
+      if (previous && previous.plan_sku !== input.plan_sku)
+        invalid("unsupported_plan", "a purchase_ref keeps its original plan");
+      if (!sub) {
+        const plan = paidPlan(input.plan_sku);
+        touch(customer);
+        if (activeSubscription(customer))
+          throw new Refusal(
+            409,
+            "subscription_exists",
+            "the user already subscribes; change the plan instead",
+          );
+        // An open checkout of the user is expired first.
+        for (const s of subscriptions)
+          if (s.customer === customer && s.state === "checkout")
+            s.state = "checkout_expired";
+        const subId = `sub_${hex()}`;
+        sub = {
+          id: subId,
+          customer,
+          purchase_ref: ref,
+          plan_sku: plan.sku,
+          state: "checkout",
+          cancel_at_period_end: false,
+          period_end: null,
+          checkout_url: `${ORIGIN}/checkout/${subId}`,
+          paid: [],
+        };
+        subscriptions.push(sub);
+      }
+      return {
+        status: 201,
+        body: {
+          subscription_id: sub.id,
+          plan_sku: sub.plan_sku,
+          state: sub.state,
+          checkout_url: sub.state === "checkout" ? sub.checkout_url : null,
+        },
+      };
+    }
+    if (action === "POST plan") {
+      const input = await body(request);
+      fields(input, ["plan_sku"]);
+      const target = paidPlan(input.plan_sku);
+      if (!payments) notConfigured();
+      touch(customer);
+      const sub = activeSubscription(customer);
+      if (!sub)
+        throw new Refusal(409, "subscription_required", "no subscription");
+      if (sub.plan_sku === target.sku)
+        throw new Refusal(409, "plan_unchanged", "already on this plan");
+      // Charged only above every plan the period was paid for; the paid
+      // difference tops the period up to the new plan's credits.
+      const charge = sub.paid.every(
+        (sku) =>
+          BigInt(target.price) >
+          BigInt(plans.find((p) => p.sku === sku)!.price),
+      );
+      if (charge) {
+        sub.paid.push(target.sku);
+        const due = (allowances.get(customer) ?? [])
+          .filter(
+            (a) => a.subscription === sub.id && a.expires_at === sub.period_end,
+          )
+          .reduce((n, a) => n + a.total, 0);
+        const top = Number(target.credits) - due;
+        if (top > 0)
+          grantAllowance(customer, {
+            key: `invoice.${sub.id}.${sub.period_end}.${target.sku}`,
+            total: top,
+            expires_at: sub.period_end!,
+            subscription: sub.id,
+          });
+      }
+      sub.plan_sku = target.sku;
+      return { status: 200, body: planView(customer) };
+    }
+    if (action === "POST plan/cancel" || action === "POST plan/resume") {
+      fields(await body(request), []);
+      if (!payments) notConfigured();
+      touch(customer);
+      const sub = activeSubscription(customer);
+      if (!sub)
+        throw new Refusal(409, "subscription_required", "no subscription");
+      sub.cancel_at_period_end = action === "POST plan/cancel";
+      return { status: 200, body: planView(customer) };
+    }
+    if (action === "POST billing-portal") {
+      const input = await body(request);
+      fields(input, ["return_path"]);
+      returnPath(input.return_path);
+      if (!payments) notConfigured();
+      if (!subscriptions.some((s) => s.customer === customer))
+        throw new Refusal(409, "subscription_required", "no Stripe customer");
+      return {
+        status: 200,
+        body: { url: `${ORIGIN}/portal/${encodeURIComponent(customer)}` },
+      };
+    }
     if (action === "POST usage") {
       const input = await body(request);
       for (const key of Object.keys(input))
@@ -284,6 +614,7 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
           invalid("invalid_metadata", "metadata must be at most 1 KB");
       }
       const request_ = canonical({ customer, units, metadata });
+      touch(customer);
       const old = entries.find((e) => e.event_id === eventId);
       if (old) {
         if (old.request !== request_)
@@ -304,6 +635,7 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
       const credits = units * creditsPerUnit;
       if (!Number.isSafeInteger(credits))
         invalid("integer_overflow", "units out of range");
+      spendAllowances(customer, credits);
       const balance = append(customer, "usage", -credits, {
         event_id: eventId,
         request: request_,
@@ -500,11 +832,15 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
     if (action === "GET history") {
       const cursor = url.searchParams.get("cursor");
       const type = url.searchParams.get("type");
-      if (type && !["purchase", "usage", "refund", "adjustment"].includes(type))
+      if (
+        type &&
+        !["purchase", "usage", "refund", "adjustment", "expiry"].includes(type)
+      )
         invalid(
           "invalid_history_type",
-          "type must be purchase, usage, refund or adjustment",
+          "type must be purchase, usage, refund, adjustment or expiry",
         );
+      touch(customer);
       const before = cursor === null ? Infinity : integer(cursor, "cursor");
       const rows = entries
         .filter(
@@ -585,6 +921,20 @@ export const createTestBilling: CreateTestBilling = async (options = {}) => {
           currency: order.currency,
           state: "fulfilled",
         },
+      });
+    },
+    async paySubscription(subscriptionId) {
+      const sub = subscriptions.find((s) => s.id === subscriptionId);
+      if (!sub) throw new Error(`no subscription ${subscriptionId}`);
+      if (sub.state !== "checkout") return;
+      sub.state = "active";
+      sub.period_end = nextMonth(iso());
+      sub.paid = [sub.plan_sku];
+      grantAllowance(sub.customer, {
+        key: `invoice.${sub.id}.${sub.period_end}`,
+        total: Number(plans.find((p) => p.sku === sub.plan_sku)!.credits),
+        expires_at: sub.period_end,
+        subscription: sub.id,
       });
     },
     close() {},

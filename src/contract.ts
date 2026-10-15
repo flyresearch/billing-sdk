@@ -545,9 +545,9 @@ export function contractSuite(name: string, create: CreateTestBilling) {
             ...retry,
           }),
         ).toEqual({ state: "rejected", reason: "offer_changed" });
-      expect((await client.orders("u")).data.map((o) => o.purchase_ref)).toEqual(
-        ["p1"],
-      );
+      expect(
+        (await client.orders("u")).data.map((o) => o.purchase_ref),
+      ).toEqual(["p1"]);
       expect(
         await client.checkout("u", {
           sku: "pack-100",
@@ -613,6 +613,83 @@ export function contractSuite(name: string, create: CreateTestBilling) {
           return_path: "/billing",
         }),
       ).toMatchObject({ state: "awaiting_payment" });
+    });
+
+    // ---- plans (ADR-0015) ----
+    const PRO = {
+      sku: "pro",
+      name: "Pro",
+      price: "990",
+      credits: "1000",
+      entitlements: { rpm: 60 },
+    };
+    const FREE = {
+      sku: "free",
+      name: "Free",
+      price: "0",
+      credits: "100",
+      entitlements: { rpm: 5 },
+    };
+    const PLANS = [PRO, FREE];
+
+    test("catalog lists the plans cheapest first, entitlements as given; without plans a user has none", async () => {
+      const { client } = await world({ plans: PLANS });
+      expect((await client.catalog()).plans).toEqual([
+        { ...FREE, currency: "usd" },
+        { ...PRO, currency: "usd" },
+      ]);
+      const none = await world();
+      expect((await none.client.catalog()).plans).toEqual([]);
+      expect(await none.client.plan("u")).toEqual({
+        plan: null,
+        period_end: null,
+        allowance: null,
+        subscription: null,
+      });
+    });
+
+    test("the free plan grants its credits once a month on first read; they are spent first and expire at the month's end", async () => {
+      let at = Date.UTC(2026, 0, 10, 12);
+      const { billing, client } = await world({
+        plans: PLANS,
+        offers: [{ sku: "pack-100", amount: "100", credits: "100" }],
+        now: () => at,
+      });
+      const first = await client.plan("u");
+      expect(first.plan?.sku).toBe("free");
+      expect(first.period_end).toBe("2026-02-01T00:00:00.000Z");
+      expect(first.allowance).toEqual({
+        total: "100",
+        remaining: "100",
+        expires_at: "2026-02-01T00:00:00.000Z",
+      });
+      expect(first.subscription).toBeNull();
+      await billing.purchase("u", "50");
+      await client.reportUsage("u", { event_id: "e1", units: "30" });
+      expect((await client.plan("u")).allowance?.remaining).toBe("70");
+      expect((await client.balance("u")).balance).toBe("120");
+      // The next month: the 70 left expire, the new month's 100 arrive.
+      at = Date.UTC(2026, 1, 1, 0, 0, 1);
+      expect((await client.balance("u")).balance).toBe("150");
+      expect((await client.plan("u")).allowance).toEqual({
+        total: "100",
+        remaining: "100",
+        expires_at: "2026-03-01T00:00:00.000Z",
+      });
+      const expiry = await client.history("u", { type: "expiry" });
+      expect(expiry.data.map((e) => [e.type, e.credits])).toEqual([
+        ["expiry", "-70"],
+      ]);
+    });
+
+    test("plan changes refuse an unknown or free plan before anything else", async () => {
+      const { client } = await world({ plans: PLANS });
+      expect(await code(client.changePlan("u", "nope"))).toBe(
+        "422 unsupported_plan",
+      );
+      expect(await code(client.changePlan("u", "free"))).toBe(
+        "422 free_plan_not_subscribable",
+      );
     });
   });
 }

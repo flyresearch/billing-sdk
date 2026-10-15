@@ -11,12 +11,14 @@ Billing 产品接口（API v1）的客户端，以及给产品自己写测试用
 ## 安装
 
 ```sh
-bun add github:flyresearch/billing-sdk#v0.6.0
+bun add github:flyresearch/billing-sdk#v0.7.0
 ```
 
 源码是 TypeScript，直接被 Bun、Deno 和 Workers 的打包器使用。`v0.1.x` 是旧接口（冻结与结算）。`v0.3` 起错误码与 Billing 服务一致：输入不合法是 422 加具体错误码（如 `invalid_integer`、`invalid_identifier`），未配置收款是 503 `stripe_not_configured`，订单完成状态为 `fulfilled`。
 
 **v0.6 的不兼容变化**：客户端不再发送 `Idempotency-Key`，Billing 也不再读它。`checkout(customer, input, key?)` 与 `createTopupSession(customer, options, key?)` 去掉了第三个参数（key），`409 idempotency_conflict` 不再出现。重试由请求本身识别，不需要另配幂等键：用量看 `event_id`，建单看（客户，`purchase_ref`）。充值链接每次调用都是新的，同一个 key 不再返回同一个链接。
+
+**v0.7** 增加订阅档位（只加不改）：`catalog().plans`、`plan()`、`subscriptionCheckout()`、`changePlan()`、`cancelPlan()`、`resumePlan()`、`billingPortal()`；流水多一种类型 `expiry`（月度额度到期作废），月度额度发放记为 `adjustment`、`note` 为 `"allowance"`。没处理 `expiry` 的界面会把它当成未知类型，请补上显示。
 
 ## 接口
 
@@ -28,7 +30,12 @@ bun add github:flyresearch/billing-sdk#v0.6.0
 | `catalog()`                                             | 在售额度包（固定档与自定金额档）和收款方式            |
 | `checkout(customer, { sku, purchase_ref, ... })`        | 在产品自己的购买页建单；同一 `purchase_ref` 只建一单  |
 | `order(customer, id)` / `orders(customer)`              | 订单状态与 `checkout_url`，付款结果以它和余额为准     |
-| `createTopupSession(customer, { return_path? })`        | 托管充值页链接（30 分钟有效），每次调用都是新链接     |
+| `createTopupSession(customer, { return_path? })`        | 托管充值页链接（30 分钟有效），每次调用都是新链接；页面也展示档位，可订阅、换档、管理订阅 |
+| `plan(customer)`                                        | 当前档位、权益、本期结束与本期月度额度                |
+| `subscriptionCheckout(customer, { plan_sku, purchase_ref, return_path? })` | 开通付费档，返回订阅收银台地址；同一 `purchase_ref` 得到同一订阅 |
+| `changePlan(customer, planSku)`                         | 换档，立即生效；价格更高时立即扣差价并补发额度差      |
+| `cancelPlan(customer)` / `resumePlan(customer)`         | 到期取消 / 撤销取消                                   |
+| `billingPortal(customer, { return_path? })`             | Stripe 客户管理页（换卡、发票、取消）                 |
 
 客户 ID 由你的产品定义，第一次出现时自动建立。金额和额度都是十进制整数字符串。
 
@@ -83,6 +90,29 @@ if (receipt.state !== "rejected" && receipt.checkout_url)
 
 建单当场返回收银台地址（HTTP 201）。Stripe 暂时不可用时返回 503：用同一个 `purchase_ref` 重试，会拿到同一个订单和同一个收银台，不会建第二单；同一个 `purchase_ref` 重发总是返回该订单的当前状态。回跳页面不是付款凭证：回来后读 `order()` 的 `state`（`fulfilled` 即已到账）和余额。回执是 `offer_changed` 时这次购买已终结：这个拒绝按（客户，`purchase_ref`）保存，之后用同一个 `purchase_ref` 重发（哪怕带上新的 `offer_version`）也只会得到同一个拒绝。用户重新确认价格后换一个新的 `purchase_ref`。自定金额档传 `amount`（最小货币单位），额度 = 金额 × `credits_per_unit`。
 
+## 订阅档位
+
+档位由负责人在控制台配置：每月价格、每期额度和产品自己定义的权益（如 `{ "rpm": 120 }`）。月度额度先于额度包使用，期末作废、不结转；额度包永不过期。免费档（价格为 0）每个自然月（UTC）在用户第一次被读写时发放。
+
+```ts
+const { plan, allowance, subscription } = await billing.plan(userId);
+applyLimits(plan?.entitlements); // 权益由产品执行，可缓存几分钟
+
+// 开通：purchaseRef 先存进产品自己的库，重试沿用
+const receipt = await billing.subscriptionCheckout(userId, {
+  plan_sku: "pro",
+  purchase_ref: purchaseRef,
+});
+if (receipt.checkout_url) redirect(receipt.checkout_url); // 只收银行卡，1 小时有效
+
+// 已订阅：换档、到期取消、管理订阅
+await billing.changePlan(userId, "team"); // 409 plan_change_payment_failed：让用户在管理页换卡
+await billing.cancelPlan(userId);
+redirect((await billing.billingPortal(userId)).url);
+```
+
+付款后档位经 Webhook 生效，以 `plan()` 为准；回跳页面不是付款凭证。不想自建方案页时，直接把用户送到 `createTopupSession` 的托管充值页。
+
 ## 测试
 
 ```ts
@@ -97,7 +127,9 @@ await billing.purchase("user_1", "5000"); // 模拟一次已付款的充值
 // billing.payOrder(orderId) 模拟付款成功
 ```
 
-选项：`offers`（在售额度包）、`creditsPerUnit`、`payments`（false 时充值链接返回 503 `stripe_not_configured`）、`returnOrigin`（允许 `return_path`）、`now`。
+选项：`offers`（在售额度包）、`plans`（在售档位）、`creditsPerUnit`、`payments`（false 时充值链接返回 503 `stripe_not_configured`）、`returnOrigin`（允许 `return_path`）、`now`。
+
+档位：免费档按月发放、先用、月底作废，与真服务一致（契约测试覆盖）。订阅是简化模拟：`subscriptionCheckout` 后用 `billing.paySubscription(subscriptionId)` 模拟付款；到期自动续费（已设到期取消的则结束）；用 `now` 选项推进时间。订阅部分不在契约内，跨期、扣款失败、退款等以 Billing 测试环境加 Stripe 测试时钟为准。
 
 假服务只覆盖产品接口，不包括托管充值页、Stripe 和管理端；通过它不代表部署可用。
 
