@@ -557,6 +557,8 @@ export const createTestBilling = async (
       const sub = activeSubscription(customer);
       if (!sub)
         throw new Refusal(409, "subscription_required", "no subscription");
+      if (sub.cancel_at_period_end)
+        throw new Refusal(409, "subscription_ending", "resume renewal first");
       if (sub.plan_sku === target.sku)
         throw new Refusal(409, "plan_unchanged", "already on this plan");
       // Charged only above every plan the period was paid for; the paid

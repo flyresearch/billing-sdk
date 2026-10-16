@@ -276,6 +276,10 @@ test("the fake simulates a subscription: checkout, payment, a charged switch, a 
   expect(
     (await client.cancelPlan("u")).subscription?.cancel_at_period_end,
   ).toBe(true);
+  // Set to end: no next period to switch; renewal comes back first.
+  expect(await code(client.changePlan("u", "starter"))).toBe(
+    "409 subscription_ending",
+  );
   expect(
     (await client.resumePlan("u")).subscription?.cancel_at_period_end,
   ).toBe(false);

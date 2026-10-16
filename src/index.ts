@@ -331,7 +331,8 @@ export function createBillingClient(config: BillingConfig) {
     /**
      * 换档，立即生效。新档价格高于本期已付过的档位时，立即按剩余天数扣差价并补发
      * 额度差（扣款失败 409 plan_change_payment_failed，档位不变）；其余换档不扣款
-     * 不退款，下期按新档。另一次换档未完成时 409 plan_change_in_progress。
+     * 不退款，下期按新档。另一次换档未完成时 409 plan_change_in_progress；订阅已设为
+     * 到期取消时 409 subscription_ending（没有下一期，先 resumePlan 再换档）。
      */
     changePlan: (id: string, planSku: string) =>
       call<CustomerPlan>("POST", `${customer(id)}/plan`, {
