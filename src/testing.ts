@@ -895,20 +895,30 @@ export const createTestBilling = async (
           if (e.group === undefined) lines.push(e);
           else groups.set(e.group, [...(groups.get(e.group) ?? []), e]);
         for (const reports of groups.values()) {
-          const latest = reports[reports.length - 1]!;
+          // The line shows its latest report, less the units and metric it
+          // takes from the whole group.
+          const {
+            units: _units,
+            metric: _metric,
+            ...latest
+          } = reports[reports.length - 1]!;
+          const metric = reports[0]!.metric;
           lines.push({
             ...latest,
             seq: reports[0]!.seq,
             id: reports[0]!.id,
             credits: reports.reduce((sum, e) => sum + e.credits, 0),
-            // Units of different metrics add up to nothing meaningful.
-            ...(reports.every((e) => e.metric === reports[0]!.metric)
+            // Units of different or unknown metrics add up to nothing
+            // meaningful, as Billing answers.
+            ...(metric !== undefined &&
+            reports.every((e) => e.metric === metric)
               ? {
                   units: reports
                     .reduce((sum, e) => sum + BigInt(e.units ?? "0"), 0n)
                     .toString(),
+                  metric,
                 }
-              : { units: undefined, metric: undefined }),
+              : {}),
             reports: reports.length,
             started_at: reports[0]!.created_at,
           });

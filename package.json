@@ -1,6 +1,6 @@
 {
   "name": "@flyresearch/billing-sdk",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "Client and in-memory test double for the Billing product API (v1)",
   "license": "MIT",
   "type": "module",
