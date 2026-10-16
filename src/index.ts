@@ -352,8 +352,9 @@ export function createBillingClient(config: BillingConfig) {
 
     /**
      * 充值、用量、退款、调账记录，新的在前，每页 50 条。grouped 为 true 时，
-     * 同一 group 的用量合成一行：credits 为合计，余额与时间取最后一次上报，
-     * 另带 reports 与 started_at；这一行排在最后一次上报的位置。
+     * 同一 group 的用量合成一行：id 与位置取第一次上报（固定不变，边上报边
+     * 翻页不重复不遗漏），credits 为合计，余额与时间取最后一次上报，另带
+     * reports 与 started_at。
      */
     history: (
       id: string,

@@ -18,7 +18,7 @@ bun add github:flyresearch/billing-sdk#v0.8.0
 
 **v0.6 的不兼容变化**：客户端不再发送 `Idempotency-Key`，Billing 也不再读它。`checkout(customer, input, key?)` 与 `createTopupSession(customer, options, key?)` 去掉了第三个参数（key），`409 idempotency_conflict` 不再出现。重试由请求本身识别，不需要另配幂等键：用量看 `event_id`，建单看（客户，`purchase_ref`）。充值链接每次调用都是新的，同一个 key 不再返回同一个链接。
 
-**v0.9** 按通话汇总流水（需要 Billing core schema 12，只加不改）：`reportUsage` 可带 `group`（一次通话或会话的标识，属于事件内容），`createMeter` 增加 `group` 选项；`history(customer, { grouped: true })` 把同一 group 的用量合成一行（`credits` 为合计，余额与时间取最后一次上报，另带 `reports`、`started_at`）；流水条目多 `group` 字段。假服务同样支持。
+**v0.9** 按通话汇总流水（需要 Billing core schema 12，只加不改）：`reportUsage` 可带 `group`（一次通话或会话的标识，属于事件内容），`createMeter` 增加 `group` 选项；`history(customer, { grouped: true })` 把同一 group 的用量合成一行（`id` 与位置取第一次上报、固定不变，`credits` 为合计，余额与时间取最后一次上报，另带 `reports`、`started_at`）；流水条目多 `group` 字段。假服务同样支持。
 
 **v0.8** 支持计量修改（ADR-0016，只加不改）：`catalog().config`（`version`、`metric`、`credits_per_unit`）进了类型；`reportUsage` 可带 `meter_version`，负责人改过计量时返回 409 `meter_changed`、不记账；`createMeter` 增加 `meterVersion` 与 `onMeterChanged`；用量回答多一个 `meter_version` 字段。假服务支持 `metric` 选项与 `billing.setMeter()`。
 

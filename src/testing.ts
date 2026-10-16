@@ -879,7 +879,8 @@ export const createTestBilling = async (
       touch(customer);
       const before = cursor === null ? Infinity : integer(cursor, "cursor");
       const own = entries.filter((e) => e.customer === customer);
-      // Grouped, a group's reports become one line at its latest report.
+      // Grouped, a group's reports become one line placed and identified by
+      // its first report, showing its total and its latest report.
       type Line = Entry & { reports?: number; started_at?: string };
       let lines: Line[] = own;
       if (grouped === "true") {
@@ -892,6 +893,8 @@ export const createTestBilling = async (
           const latest = reports[reports.length - 1]!;
           lines.push({
             ...latest,
+            seq: reports[0]!.seq,
+            id: reports[0]!.id,
             credits: reports.reduce((sum, e) => sum + e.credits, 0),
             reports: reports.length,
             started_at: reports[0]!.created_at,

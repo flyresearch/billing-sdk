@@ -247,9 +247,13 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       expect(Number.isFinite(Date.parse(grouped[1]!.started_at ?? ""))).toBe(
         true,
       );
-      // Each report stays its own line, carrying its group.
+      // Each report stays its own line, carrying its group; the grouped line
+      // keeps its first report's id.
       const each = (await client.history("u")).data;
       expect(each).toHaveLength(5);
+      expect(grouped[1]!.id).toBe(
+        each.find((e) => e.event_id === "call-7:1")!.id,
+      );
       expect(each[1]).toMatchObject({ group: "call-7", credits: "-2" });
       expect(each[1]).not.toHaveProperty("reports");
       // The group is part of the event: another one is a conflict.
