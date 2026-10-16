@@ -276,6 +276,38 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       ).toBe("invalid_history_grouped");
     });
 
+    test("a group's units survive a rate change and are withheld once its metric changed", async () => {
+      const { billing, client } = await world();
+      await billing.purchase("u", "1000");
+      await client.reportUsage("u", {
+        event_id: "c:1",
+        units: "3",
+        group: "c",
+      });
+      await billing.setMeter({ metric: "units", credits_per_unit: "2" });
+      await client.reportUsage("u", {
+        event_id: "c:2",
+        units: "4",
+        group: "c",
+      });
+      let [line] = (await client.history("u", { grouped: true })).data;
+      expect(line).toMatchObject({ credits: "-11", units: "7", reports: 2 });
+      await billing.setMeter({ metric: "minutes", credits_per_unit: "2" });
+      await client.reportUsage("u", {
+        event_id: "c:3",
+        units: "1",
+        group: "c",
+      });
+      [line] = (await client.history("u", { grouped: true })).data;
+      expect(line).toMatchObject({ credits: "-13", reports: 3 });
+      expect(line).not.toHaveProperty("units");
+      expect(
+        (await client.history("u")).data
+          .filter((e) => e.type === "usage")
+          .map((e) => e.units),
+      ).toEqual(["1", "4", "3"]);
+    });
+
     test("a top-up link is a 30-minute URL on the service; a return path needs a return origin", async () => {
       const now = Date.parse("2026-10-14T00:00:00.000Z");
       const plain = await world({ now: () => now });

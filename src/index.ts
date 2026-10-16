@@ -62,7 +62,7 @@ export interface HistoryEntry {
   note?: string;
   /**
    * 仅用量：上报的单位数（整数字符串）。grouped 行是各次上报原样相加，不随
-   * 费率变化，适合显示时长；同一 group 中途换了计量单位时相加没有意义。
+   * 费率变化，适合显示时长；同一 group 中途换了计量单位（metric）时不返回。
    */
   units?: string;
   /** 上报时带的 group（一次通话或会话） */

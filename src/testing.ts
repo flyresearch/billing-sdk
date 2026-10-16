@@ -160,6 +160,8 @@ interface Entry {
   metadata?: Record<string, string>;
   note?: string;
   units?: string;
+  /** The metric the units were measured in, for summing a group. */
+  metric?: string;
   group?: string;
   order?: { id: string; amount: string; currency: string; state: string };
 }
@@ -672,6 +674,7 @@ export const createTestBilling = async (
         event_id: eventId,
         request: request_,
         units: String(units),
+        metric: meter.metric,
         ...(metadata === null ? {} : { metadata }),
         ...(group === null ? {} : { group }),
       });
@@ -898,9 +901,12 @@ export const createTestBilling = async (
             seq: reports[0]!.seq,
             id: reports[0]!.id,
             credits: reports.reduce((sum, e) => sum + e.credits, 0),
-            units: reports
-              .reduce((sum, e) => sum + BigInt(e.units ?? "0"), 0n)
-              .toString(),
+            // Units of different metrics add up to nothing meaningful.
+            units: reports.every((e) => e.metric === reports[0]!.metric)
+              ? reports
+                  .reduce((sum, e) => sum + BigInt(e.units ?? "0"), 0n)
+                  .toString()
+              : undefined,
             reports: reports.length,
             started_at: reports[0]!.created_at,
           });
