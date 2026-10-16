@@ -159,6 +159,7 @@ interface Entry {
   request?: string;
   metadata?: Record<string, string>;
   note?: string;
+  units?: string;
   group?: string;
   order?: { id: string; amount: string; currency: string; state: string };
 }
@@ -670,6 +671,7 @@ export const createTestBilling = async (
       const balance = append(customer, "usage", -credits, {
         event_id: eventId,
         request: request_,
+        units: String(units),
         ...(metadata === null ? {} : { metadata }),
         ...(group === null ? {} : { group }),
       });
@@ -896,6 +898,9 @@ export const createTestBilling = async (
             seq: reports[0]!.seq,
             id: reports[0]!.id,
             credits: reports.reduce((sum, e) => sum + e.credits, 0),
+            units: reports
+              .reduce((sum, e) => sum + BigInt(e.units ?? "0"), 0n)
+              .toString(),
             reports: reports.length,
             started_at: reports[0]!.created_at,
           });
@@ -918,6 +923,7 @@ export const createTestBilling = async (
             ...(e.event_id === undefined ? {} : { event_id: e.event_id }),
             ...(e.metadata === undefined ? {} : { metadata: e.metadata }),
             ...(e.note === undefined ? {} : { note: e.note }),
+            ...(e.units === undefined ? {} : { units: e.units }),
             ...(e.group === undefined ? {} : { group: e.group }),
             ...(e.reports === undefined
               ? {}

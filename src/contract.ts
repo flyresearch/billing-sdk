@@ -243,7 +243,10 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       expect(grouped[1]).toMatchObject({
         balance_after: "88",
         event_id: "call-7:3",
+        units: "12",
       });
+      expect(grouped[0]!.units).toBe("3");
+      expect(grouped[2]).not.toHaveProperty("units");
       expect(Number.isFinite(Date.parse(grouped[1]!.started_at ?? ""))).toBe(
         true,
       );
@@ -254,7 +257,11 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       expect(grouped[1]!.id).toBe(
         each.find((e) => e.event_id === "call-7:1")!.id,
       );
-      expect(each[1]).toMatchObject({ group: "call-7", credits: "-2" });
+      expect(each[1]).toMatchObject({
+        group: "call-7",
+        credits: "-2",
+        units: "2",
+      });
       expect(each[1]).not.toHaveProperty("reports");
       // The group is part of the event: another one is a conflict.
       await expect(
