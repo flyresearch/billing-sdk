@@ -60,6 +60,12 @@ export interface HistoryEntry {
   event_id?: string;
   metadata?: Record<string, string>;
   note?: string;
+  /** 上报时带的 group（一次通话或会话） */
+  group?: string;
+  /** 仅 grouped 读取：这一行合计了几次上报 */
+  reports?: number;
+  /** 仅 grouped 读取：这个 group 第一次上报的时间 */
+  started_at?: string;
   order?: { id: string; amount: string; currency: string; state: string };
 }
 
@@ -250,6 +256,8 @@ export function createBillingClient(config: BillingConfig) {
      * 用量一定会被记账；响应的 allowed 为 false 时结束工作。
      * 带上 meter_version（catalog().config.version）时，负责人改过计量会返回
      * 409 meter_changed、不记账：重读计量，换算成新单位后重报（可沿用 event_id）。
+     * group（一次通话或会话的标识）属于事件内容；history({ grouped: true })
+     * 把同一 group 的上报合成一行。
      */
     reportUsage: (
       id: string,
@@ -258,6 +266,7 @@ export function createBillingClient(config: BillingConfig) {
         units: string;
         metadata?: Record<string, string>;
         meter_version?: string;
+        group?: string;
       },
     ) => call<UsageResult>("POST", `${customer(id)}/usage`, usage),
 
@@ -341,14 +350,23 @@ export function createBillingClient(config: BillingConfig) {
         `${customer(id)}/orders${options.cursor ? `?cursor=${encodeURIComponent(options.cursor)}` : ""}`,
       ),
 
-    /** 充值、用量、退款、调账记录，新的在前，每页 50 条 */
+    /**
+     * 充值、用量、退款、调账记录，新的在前，每页 50 条。grouped 为 true 时，
+     * 同一 group 的用量合成一行：credits 为合计，余额与时间取最后一次上报，
+     * 另带 reports 与 started_at；这一行排在最后一次上报的位置。
+     */
     history: (
       id: string,
-      options: { cursor?: string; type?: HistoryEntry["type"] } = {},
+      options: {
+        cursor?: string;
+        type?: HistoryEntry["type"];
+        grouped?: boolean;
+      } = {},
     ) => {
       const query = new URLSearchParams();
       if (options.cursor) query.set("cursor", options.cursor);
       if (options.type) query.set("type", options.type);
+      if (options.grouped) query.set("grouped", "true");
       const suffix = query.size ? `?${query}` : "";
       return call<{
         data: HistoryEntry[];
@@ -369,6 +387,8 @@ export interface MeterOptions {
   intervalMs?: number;
   /** 随每条用量记入流水的字符串键值（≤1 KB），例如是哪个 Agent 在运行 */
   metadata?: Record<string, string>;
+  /** 这次工作的 group（例如通话 ID），随每条用量上报，流水可按它合成一行 */
+  group?: string;
   /**
    * 余额用尽（allowed 为 false）或账户已关闭（409 account_closed）时调用一次，
    * 产品在这里结束工作
@@ -422,6 +442,7 @@ export function createMeter(client: BillingClient, options: MeterOptions) {
     units: string;
     metadata?: Record<string, string>;
     meter_version?: string;
+    group?: string;
   } | null = null;
   let stopped = false;
   let closed = false;
@@ -441,6 +462,7 @@ export function createMeter(client: BillingClient, options: MeterOptions) {
         event_id: `${options.eventPrefix}:${++sequence}`,
         units: buffered.toString(),
         ...(options.metadata ? { metadata: options.metadata } : {}),
+        ...(options.group ? { group: options.group } : {}),
         ...(options.meterVersion
           ? { meter_version: options.meterVersion }
           : {}),

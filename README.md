@@ -18,26 +18,28 @@ bun add github:flyresearch/billing-sdk#v0.8.0
 
 **v0.6 的不兼容变化**：客户端不再发送 `Idempotency-Key`，Billing 也不再读它。`checkout(customer, input, key?)` 与 `createTopupSession(customer, options, key?)` 去掉了第三个参数（key），`409 idempotency_conflict` 不再出现。重试由请求本身识别，不需要另配幂等键：用量看 `event_id`，建单看（客户，`purchase_ref`）。充值链接每次调用都是新的，同一个 key 不再返回同一个链接。
 
+**v0.9** 按通话汇总流水（需要 Billing core schema 12，只加不改）：`reportUsage` 可带 `group`（一次通话或会话的标识，属于事件内容），`createMeter` 增加 `group` 选项；`history(customer, { grouped: true })` 把同一 group 的用量合成一行（`credits` 为合计，余额与时间取最后一次上报，另带 `reports`、`started_at`）；流水条目多 `group` 字段。假服务同样支持。
+
 **v0.8** 支持计量修改（ADR-0016，只加不改）：`catalog().config`（`version`、`metric`、`credits_per_unit`）进了类型；`reportUsage` 可带 `meter_version`，负责人改过计量时返回 409 `meter_changed`、不记账；`createMeter` 增加 `meterVersion` 与 `onMeterChanged`；用量回答多一个 `meter_version` 字段。假服务支持 `metric` 选项与 `billing.setMeter()`。
 
 **v0.7** 增加订阅档位（只加不改）：`catalog().plans`、`plan()`、`subscriptionCheckout()`、`changePlan()`、`cancelPlan()`、`resumePlan()`、`billingPortal()`；流水多一种类型 `expiry`（月度额度到期作废），月度额度发放记为 `adjustment`、`note` 为 `"allowance"`。没处理 `expiry` 的界面会把它当成未知类型，请补上显示。
 
 ## 接口
 
-| 方法                                                    | 作用                                                  |
-| ------------------------------------------------------- | ----------------------------------------------------- |
-| `balance(customer)`                                     | `{ balance, allowed }`；`allowed` 为 false 就不开始   |
-| `reportUsage(customer, { event_id, units, metadata? })` | 上报已发生的用量。按 `event_id` 识别，重发不重复扣费   |
-| `history(customer, { cursor?, type? })`                 | 充值、用量、退款、调账记录                            |
-| `catalog()`                                             | 在售额度包（固定档与自定金额档）和收款方式            |
-| `checkout(customer, { sku, purchase_ref, ... })`        | 在产品自己的购买页建单；同一 `purchase_ref` 只建一单  |
-| `order(customer, id)` / `orders(customer)`              | 订单状态与 `checkout_url`，付款结果以它和余额为准     |
-| `createTopupSession(customer, { return_path? })`        | 托管充值页链接（30 分钟有效），每次调用都是新链接；页面也展示档位，可订阅、换档、管理订阅 |
-| `plan(customer)`                                        | 当前档位、权益、本期结束与本期月度额度                |
-| `subscriptionCheckout(customer, { plan_sku, purchase_ref, return_path? })` | 开通付费档，返回订阅收银台地址；同一 `purchase_ref` 得到同一订阅 |
-| `changePlan(customer, planSku)`                         | 换档，立即生效；价格更高时立即扣差价并补发额度差      |
-| `cancelPlan(customer)` / `resumePlan(customer)`         | 到期取消 / 撤销取消                                   |
-| `billingPortal(customer, { return_path? })`             | Stripe 客户管理页（换卡、发票、取消）                 |
+| 方法                                                                       | 作用                                                                                      |
+| -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `balance(customer)`                                                        | `{ balance, allowed }`；`allowed` 为 false 就不开始                                       |
+| `reportUsage(customer, { event_id, units, metadata?, group? })`            | 上报已发生的用量。按 `event_id` 识别，重发不重复扣费                                      |
+| `history(customer, { cursor?, type?, grouped? })`                          | 充值、用量、退款、调账记录；`grouped` 按 group 合成一行                                   |
+| `catalog()`                                                                | 在售额度包（固定档与自定金额档）和收款方式                                                |
+| `checkout(customer, { sku, purchase_ref, ... })`                           | 在产品自己的购买页建单；同一 `purchase_ref` 只建一单                                      |
+| `order(customer, id)` / `orders(customer)`                                 | 订单状态与 `checkout_url`，付款结果以它和余额为准                                         |
+| `createTopupSession(customer, { return_path? })`                           | 托管充值页链接（30 分钟有效），每次调用都是新链接；页面也展示档位，可订阅、换档、管理订阅 |
+| `plan(customer)`                                                           | 当前档位、权益、本期结束与本期月度额度                                                    |
+| `subscriptionCheckout(customer, { plan_sku, purchase_ref, return_path? })` | 开通付费档，返回订阅收银台地址；同一 `purchase_ref` 得到同一订阅                          |
+| `changePlan(customer, planSku)`                                            | 换档，立即生效；价格更高时立即扣差价并补发额度差                                          |
+| `cancelPlan(customer)` / `resumePlan(customer)`                            | 到期取消 / 撤销取消                                                                       |
+| `billingPortal(customer, { return_path? })`                                | Stripe 客户管理页（换卡、发票、取消）                                                     |
 
 客户 ID 由你的产品定义，第一次出现时自动建立。金额和额度都是十进制整数字符串。
 

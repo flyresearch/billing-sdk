@@ -212,6 +212,59 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       expect((await client.history("other")).data).toEqual([]);
     });
 
+    test("usage under a group reads back as one line with grouped history", async () => {
+      const { billing, client, raw } = await world();
+      await billing.purchase("u", "100");
+      const meter = createMeter(client, {
+        customer: "u",
+        eventPrefix: "call-7",
+        group: "call-7",
+        intervalMs: 3_600_000,
+      });
+      for (const units of ["5", "5", "2"]) {
+        meter.add(BigInt(units));
+        await meter.flush();
+      }
+      await meter.close();
+      await client.reportUsage("u", { event_id: "job-1", units: "3" });
+      const grouped = (await client.history("u", { grouped: true })).data;
+      expect(
+        grouped.map((e) => [
+          e.type,
+          e.credits,
+          e.group ?? null,
+          e.reports ?? null,
+        ]),
+      ).toEqual([
+        ["usage", "-3", null, null],
+        ["usage", "-12", "call-7", 3],
+        ["purchase", "100", null, null],
+      ]);
+      expect(grouped[1]).toMatchObject({
+        balance_after: "88",
+        event_id: "call-7:3",
+      });
+      expect(Number.isFinite(Date.parse(grouped[1]!.started_at ?? ""))).toBe(
+        true,
+      );
+      // Each report stays its own line, carrying its group.
+      const each = (await client.history("u")).data;
+      expect(each).toHaveLength(5);
+      expect(each[1]).toMatchObject({ group: "call-7", credits: "-2" });
+      expect(each[1]).not.toHaveProperty("reports");
+      // The group is part of the event: another one is a conflict.
+      await expect(
+        client.reportUsage("u", {
+          event_id: "call-7:1",
+          units: "5",
+          group: "call-8",
+        }),
+      ).rejects.toMatchObject({ code: "event_conflict" });
+      expect(
+        (await raw("GET", "/v1/customers/u/history?grouped=yes")).body.code,
+      ).toBe("invalid_history_grouped");
+    });
+
     test("a top-up link is a 30-minute URL on the service; a return path needs a return origin", async () => {
       const now = Date.parse("2026-10-14T00:00:00.000Z");
       const plain = await world({ now: () => now });

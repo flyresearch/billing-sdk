@@ -159,6 +159,7 @@ interface Entry {
   request?: string;
   metadata?: Record<string, string>;
   note?: string;
+  group?: string;
   order?: { id: string; amount: string; currency: string; state: string };
 }
 
@@ -606,7 +607,11 @@ export const createTestBilling = async (
     if (action === "POST usage") {
       const input = await body(request);
       for (const key of Object.keys(input))
-        if (!["event_id", "units", "metadata", "meter_version"].includes(key))
+        if (
+          !["event_id", "units", "metadata", "meter_version", "group"].includes(
+            key,
+          )
+        )
           invalid("unexpected_field", `unknown field ${key}`);
       const eventId = id(input.event_id, "event_id");
       const units = integer(input.units, "units");
@@ -614,6 +619,7 @@ export const createTestBilling = async (
         input.meter_version === undefined
           ? null
           : id(input.meter_version, "meter_version");
+      const group = input.group === undefined ? null : id(input.group, "group");
       const metadata = (input.metadata ?? null) as Record<
         string,
         string
@@ -626,7 +632,12 @@ export const createTestBilling = async (
         if (new TextEncoder().encode(JSON.stringify(metadata)).length > 1024)
           invalid("invalid_metadata", "metadata must be at most 1 KB");
       }
-      const request_ = canonical({ customer, units, metadata });
+      const request_ = canonical({
+        customer,
+        units,
+        metadata,
+        ...(group === null ? {} : { group }),
+      });
       touch(customer);
       const old = entries.find((e) => e.event_id === eventId);
       if (old) {
@@ -660,6 +671,7 @@ export const createTestBilling = async (
         event_id: eventId,
         request: request_,
         ...(metadata === null ? {} : { metadata }),
+        ...(group === null ? {} : { group }),
       });
       return {
         status: 200,
@@ -853,6 +865,7 @@ export const createTestBilling = async (
     if (action === "GET history") {
       const cursor = url.searchParams.get("cursor");
       const type = url.searchParams.get("type");
+      const grouped = url.searchParams.get("grouped");
       if (
         type &&
         !["purchase", "usage", "refund", "adjustment", "expiry"].includes(type)
@@ -861,15 +874,33 @@ export const createTestBilling = async (
           "invalid_history_type",
           "type must be purchase, usage, refund, adjustment or expiry",
         );
+      if (grouped !== null && grouped !== "true" && grouped !== "false")
+        invalid("invalid_history_grouped", "grouped must be true or false");
       touch(customer);
       const before = cursor === null ? Infinity : integer(cursor, "cursor");
-      const rows = entries
-        .filter(
-          (e) =>
-            e.customer === customer &&
-            e.seq < before &&
-            (!type || e.type === type),
-        )
+      const own = entries.filter((e) => e.customer === customer);
+      // Grouped, a group's reports become one line at its latest report.
+      type Line = Entry & { reports?: number; started_at?: string };
+      let lines: Line[] = own;
+      if (grouped === "true") {
+        const groups = new Map<string, Entry[]>();
+        lines = [];
+        for (const e of own)
+          if (e.group === undefined) lines.push(e);
+          else groups.set(e.group, [...(groups.get(e.group) ?? []), e]);
+        for (const reports of groups.values()) {
+          const latest = reports[reports.length - 1]!;
+          lines.push({
+            ...latest,
+            credits: reports.reduce((sum, e) => sum + e.credits, 0),
+            reports: reports.length,
+            started_at: reports[0]!.created_at,
+          });
+        }
+        lines.sort((a, b) => a.seq - b.seq);
+      }
+      const rows = lines
+        .filter((e) => e.seq < before && (!type || e.type === type))
         .reverse();
       const page = rows.slice(0, PAGE);
       return {
@@ -884,6 +915,10 @@ export const createTestBilling = async (
             ...(e.event_id === undefined ? {} : { event_id: e.event_id }),
             ...(e.metadata === undefined ? {} : { metadata: e.metadata }),
             ...(e.note === undefined ? {} : { note: e.note }),
+            ...(e.group === undefined ? {} : { group: e.group }),
+            ...(e.reports === undefined
+              ? {}
+              : { reports: e.reports, started_at: e.started_at }),
             ...(e.order === undefined ? {} : { order: e.order }),
           })),
           has_more: rows.length > PAGE,
