@@ -247,6 +247,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       });
       expect(grouped[0]!.units).toBe("3");
       expect(grouped[2]).not.toHaveProperty("units");
+      expect(grouped[2]).not.toHaveProperty("metric");
       expect(Number.isFinite(Date.parse(grouped[1]!.started_at ?? ""))).toBe(
         true,
       );
@@ -291,7 +292,12 @@ export function contractSuite(name: string, create: CreateTestBilling) {
         group: "c",
       });
       let [line] = (await client.history("u", { grouped: true })).data;
-      expect(line).toMatchObject({ credits: "-11", units: "7", reports: 2 });
+      expect(line).toMatchObject({
+        credits: "-11",
+        units: "7",
+        metric: "units",
+        reports: 2,
+      });
       await billing.setMeter({ metric: "minutes", credits_per_unit: "2" });
       await client.reportUsage("u", {
         event_id: "c:3",
@@ -301,11 +307,16 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       [line] = (await client.history("u", { grouped: true })).data;
       expect(line).toMatchObject({ credits: "-13", reports: 3 });
       expect(line).not.toHaveProperty("units");
+      expect(line).not.toHaveProperty("metric");
       expect(
         (await client.history("u")).data
           .filter((e) => e.type === "usage")
-          .map((e) => e.units),
-      ).toEqual(["1", "4", "3"]);
+          .map((e) => [e.units, e.metric]),
+      ).toEqual([
+        ["1", "minutes"],
+        ["4", "units"],
+        ["3", "units"],
+      ]);
     });
 
     test("a top-up link is a 30-minute URL on the service; a return path needs a return origin", async () => {

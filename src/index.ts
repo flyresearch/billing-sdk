@@ -65,6 +65,8 @@ export interface HistoryEntry {
    * 费率变化，适合显示时长；同一 group 中途换了计量单位（metric）时不返回。
    */
   units?: string;
+  /** 仅用量：units 的计量单位（catalog().config.metric）；旧记录与混合单位的 grouped 行没有 */
+  metric?: string;
   /** 上报时带的 group（一次通话或会话） */
   group?: string;
   /** 仅 grouped 读取：这一行合计了几次上报 */

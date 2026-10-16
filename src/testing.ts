@@ -902,11 +902,13 @@ export const createTestBilling = async (
             id: reports[0]!.id,
             credits: reports.reduce((sum, e) => sum + e.credits, 0),
             // Units of different metrics add up to nothing meaningful.
-            units: reports.every((e) => e.metric === reports[0]!.metric)
-              ? reports
-                  .reduce((sum, e) => sum + BigInt(e.units ?? "0"), 0n)
-                  .toString()
-              : undefined,
+            ...(reports.every((e) => e.metric === reports[0]!.metric)
+              ? {
+                  units: reports
+                    .reduce((sum, e) => sum + BigInt(e.units ?? "0"), 0n)
+                    .toString(),
+                }
+              : { units: undefined, metric: undefined }),
             reports: reports.length,
             started_at: reports[0]!.created_at,
           });
@@ -930,6 +932,7 @@ export const createTestBilling = async (
             ...(e.metadata === undefined ? {} : { metadata: e.metadata }),
             ...(e.note === undefined ? {} : { note: e.note }),
             ...(e.units === undefined ? {} : { units: e.units }),
+            ...(e.metric === undefined ? {} : { metric: e.metric }),
             ...(e.group === undefined ? {} : { group: e.group }),
             ...(e.reports === undefined
               ? {}
