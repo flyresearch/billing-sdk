@@ -480,9 +480,9 @@ export const createTestBilling = async (
       };
     if (
       parts[0] !== "v1" ||
-      parts[1] !== "customers" ||
+      parts[1] !== "users" ||
       (parts.length !== 4 &&
-        !(parts.length === 5 && ["orders", "plan"].includes(parts[3]!)))
+        !(parts.length === 5 && ["orders", "subscription"].includes(parts[3]!)))
     )
       throw new Refusal(404, "not_found", "no such route");
     const customer = id(parts[2], "customer");
@@ -587,14 +587,17 @@ export const createTestBilling = async (
       sub.plan_sku = target.sku;
       return { status: 200, body: planView(customer) };
     }
-    if (action === "POST plan/cancel" || action === "POST plan/resume") {
+    if (
+      action === "POST subscription/cancel" ||
+      action === "POST subscription/resume"
+    ) {
       fields(await body(request), []);
       if (!payments) notConfigured();
       touch(customer);
       const sub = activeSubscription(customer);
       if (!sub)
         throw new Refusal(409, "subscription_required", "no subscription");
-      sub.cancel_at_period_end = action === "POST plan/cancel";
+      sub.cancel_at_period_end = action === "POST subscription/cancel";
       return { status: 200, body: planView(customer) };
     }
     if (action === "POST billing-portal") {
@@ -690,7 +693,7 @@ export const createTestBilling = async (
         },
       };
     }
-    if (action === "POST topup-sessions") {
+    if (action === "POST purchase-sessions") {
       const input = await body(request);
       for (const key of Object.keys(input))
         if (key !== "return_path")
@@ -723,7 +726,7 @@ export const createTestBilling = async (
       return {
         status: 201,
         body: {
-          url: `${ORIGIN}/topup/ts_${hex()}`,
+          url: `${ORIGIN}/pay/ts_${hex()}`,
           expires_at: new Date(now() + 30 * 60_000).toISOString(),
         },
       };

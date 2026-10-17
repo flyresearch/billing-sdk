@@ -11,8 +11,10 @@ Billing 产品接口（API v1）的客户端，以及给产品自己写测试用
 ## 安装
 
 ```sh
-bun add github:flyresearch/billing-sdk#v0.10.1
+bun add github:flyresearch/billing-sdk#v0.11.0
 ```
+
+v0.11.0 requires the Billing URL migration: `/v1/users`, `purchase-sessions`, and `subscription/cancel|resume`. It does not fall back to the old routes. Client method names and billing semantics are unchanged; coordinate the service and product deployment.
 
 源码是 TypeScript，直接被 Bun、Deno 和 Workers 的打包器使用。`v0.1.x` 是旧接口（冻结与结算）。`v0.3` 起错误码与 Billing 服务一致：输入不合法是 422 加具体错误码（如 `invalid_integer`、`invalid_identifier`），未配置收款是 503 `stripe_not_configured`，订单完成状态为 `fulfilled`。
 

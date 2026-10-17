@@ -251,7 +251,7 @@ export function createBillingClient(config: BillingConfig) {
       );
     return result as T;
   };
-  const customer = (id: string) => `/v1/customers/${encodeURIComponent(id)}`;
+  const customer = (id: string) => `/v1/users/${encodeURIComponent(id)}`;
 
   return {
     /** 当前余额。开始工作前读一次，allowed 为 false 就不开始 */
@@ -285,7 +285,7 @@ export function createBillingClient(config: BillingConfig) {
     createTopupSession: (id: string, options: { return_path?: string } = {}) =>
       call<{ url: string; expires_at: string }>(
         "POST",
-        `${customer(id)}/topup-sessions`,
+        `${customer(id)}/purchase-sessions`,
         options,
       ),
 
@@ -341,11 +341,11 @@ export function createBillingClient(config: BillingConfig) {
 
     /** 到期取消：本期照常使用，结束后回到免费档 */
     cancelPlan: (id: string) =>
-      call<CustomerPlan>("POST", `${customer(id)}/plan/cancel`, {}),
+      call<CustomerPlan>("POST", `${customer(id)}/subscription/cancel`, {}),
 
     /** 撤销到期取消 */
     resumePlan: (id: string) =>
-      call<CustomerPlan>("POST", `${customer(id)}/plan/resume`, {}),
+      call<CustomerPlan>("POST", `${customer(id)}/subscription/resume`, {}),
 
     /** Stripe 客户管理页链接（换卡、发票、取消），之后回到产品 */
     billingPortal: (id: string, options: { return_path?: string } = {}) =>

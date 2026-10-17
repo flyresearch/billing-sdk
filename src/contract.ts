@@ -162,7 +162,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
           "invalid_metadata",
         ],
       ] as const) {
-        const result = await raw("POST", "/v1/customers/u/usage", body);
+        const result = await raw("POST", "/v1/users/u/usage", body);
         expect({ body, status: result.status, code: result.body.code }).toEqual(
           { body, status: 422, code },
         );
@@ -273,7 +273,7 @@ export function contractSuite(name: string, create: CreateTestBilling) {
         }),
       ).rejects.toMatchObject({ code: "event_conflict" });
       expect(
-        (await raw("GET", "/v1/customers/u/history?grouped=yes")).body.code,
+        (await raw("GET", "/v1/users/u/history?grouped=yes")).body.code,
       ).toBe("invalid_history_grouped");
     });
 
@@ -323,9 +323,9 @@ export function contractSuite(name: string, create: CreateTestBilling) {
       const now = Date.parse("2026-10-14T00:00:00.000Z");
       const plain = await world({ now: () => now });
       const link = await plain.client.createTopupSession("u");
-      expect(
-        link.url.startsWith(`${plain.billing.config.baseUrl}/topup/`),
-      ).toBe(true);
+      expect(link.url.startsWith(`${plain.billing.config.baseUrl}/pay/`)).toBe(
+        true,
+      );
       expect(Date.parse(link.expires_at) - now).toBe(30 * 60_000);
       expect(
         await code(
