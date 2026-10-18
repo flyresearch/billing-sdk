@@ -11,7 +11,7 @@ Billing 产品接口（API v1）的客户端，以及给产品自己写测试用
 ## 安装
 
 ```sh
-bun add github:flyresearch/billing-sdk#v0.11.0
+bun add github:flyresearch/billing-sdk#v0.12.0
 ```
 
 v0.11.0 requires the Billing URL migration: `/v1/users`, `purchase-sessions`, and `subscription/cancel|resume`. It does not fall back to the old routes. Client method names and billing semantics are unchanged; coordinate the service and product deployment.
@@ -162,3 +162,7 @@ await billing.purchase("user_1", "5000"); // 模拟一次已付款的充值
 ## 许可
 
 MIT
+
+Profile synchronization: `profileSync()` reads the initial generation, `syncUserProfile()` sends a complete versioned snapshot, and `profileBaseline()` reads only version/clear markers for explicit recovery. Persist the generation; never automatically adopt a changed one after a conflict. Profile failures must not block usage reporting.
+
+资料同步冲突的 `BillingError` 保留可选的 `profile_revision`（精确字符串）、`profile_sync_generation`、`request_id` 和 `retryable`；只接收格式正确的白名单字段，不附加原始响应或联系资料。`retryable` 不授权自动抬版本或换代。

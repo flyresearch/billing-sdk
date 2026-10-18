@@ -200,6 +200,11 @@ export interface Order {
 }
 
 export class BillingError extends Error {
+  retryAfter?: number;
+  request_id?: string;
+  profile_revision?: string;
+  profile_sync_generation?: string;
+  retryable?: boolean;
   constructor(
     readonly status: number,
     readonly code: string,
@@ -208,6 +213,33 @@ export class BillingError extends Error {
     super(message);
     this.name = "BillingError";
   }
+}
+
+export interface UserProfile {
+  display_name: string | null;
+  email: string | null;
+  phone: string | null;
+}
+export interface ProfileSyncState {
+  generation: string;
+  paused: boolean;
+}
+export interface UserProfileSnapshot {
+  user_id: string;
+  profile_revision: string;
+  profile_sync_generation: string;
+  profile: UserProfile;
+}
+export interface ProfileSyncReceipt {
+  user_id: string;
+  profile_revision: string;
+  profile_sync_generation: string;
+  synced_at: string;
+}
+export interface ProfileBaseline extends ProfileSyncState {
+  data: Array<{ user_id: string; profile_revision: string; cleared: boolean }>;
+  has_more: boolean;
+  next_cursor: string | null;
 }
 
 export function createBillingClient(config: BillingConfig) {
@@ -243,17 +275,57 @@ export function createBillingClient(config: BillingConfig) {
         "Billing answered with a body that is not a JSON object",
       );
     const result = (isObject ? parsed : {}) as Record<string, unknown>;
-    if (!response.ok)
-      throw new BillingError(
+    if (!response.ok) {
+      const error = new BillingError(
         response.status,
         String(result.code ?? response.status),
         String(result.message ?? result.code ?? `HTTP ${response.status}`),
       );
+      // Keep only typed diagnostics; never attach the response/contact payload.
+      for (const key of ["request_id", "profile_sync_generation"] as const) {
+        const value = result[key];
+        if (
+          typeof value === "string" &&
+          value.length > 0 &&
+          value.length <= 200 &&
+          !/[\u0000-\u001f\u007f]/.test(value)
+        )
+          error[key] = value;
+      }
+      const revision = result.profile_revision;
+      if (
+        typeof revision === "string" &&
+        /^(0|[1-9][0-9]{0,18})$/.test(revision) &&
+        BigInt(revision) <= 9223372036854775807n
+      )
+        error.profile_revision = revision;
+      if (typeof result.retryable === "boolean")
+        error.retryable = result.retryable;
+      const retry = response.headers.get("retry-after");
+      if (retry && /^\d+$/.test(retry)) error.retryAfter = Number(retry);
+      else if (retry && Number.isFinite(Date.parse(retry)))
+        error.retryAfter = Math.max(
+          0,
+          Math.ceil((Date.parse(retry) - Date.now()) / 1000),
+        );
+      throw error;
+    }
     return result as T;
   };
   const customer = (id: string) => `/v1/users/${encodeURIComponent(id)}`;
 
   return {
+    /** Read once on initial setup. A generation mismatch requires explicit recovery, never automatic adoption. */
+    profileSync: () => call<ProfileSyncState>("GET", "/v1/profile-sync"),
+    profileBaseline: (cursor?: string) =>
+      call<ProfileBaseline>(
+        "GET",
+        "/v1/profile-sync/baseline" +
+          (cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""),
+      ),
+    /** Full snapshot, same revision/content on retry. This does not open or fund an account. */
+    syncUserProfile: (snapshot: UserProfileSnapshot) =>
+      call<ProfileSyncReceipt>("POST", "/v1/user-profiles", snapshot),
     /** 当前余额。开始工作前读一次，allowed 为 false 就不开始 */
     balance: (id: string) => call<Standing>("GET", `${customer(id)}/balance`),
 

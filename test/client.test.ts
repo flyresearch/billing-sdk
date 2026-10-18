@@ -292,3 +292,105 @@ test("the fake simulates a subscription: checkout, payment, a charged switch, a 
   expect(view.subscription).toBeNull();
   expect(await code(client.cancelPlan("u"))).toBe("409 subscription_required");
 });
+
+test("profile sync preserves the exact revision, generation and explicit nulls", async () => {
+  const sent: Array<{ path: string; body: unknown }> = [];
+  const client = createBillingClient({
+    baseUrl: "https://billing.test",
+    apiKey: "key_test.synthetic",
+    fetch: (async (input, init) => {
+      sent.push({
+        path: new URL(String(input)).pathname,
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      });
+      return Response.json({
+        user_id: "u",
+        profile_revision: "9007199254740993",
+        profile_sync_generation: "g",
+        synced_at: "2026-10-17T00:00:00.000Z",
+      });
+    }) as typeof fetch,
+  });
+  const snapshot = {
+    user_id: "u",
+    profile_revision: "9007199254740993",
+    profile_sync_generation: "g",
+    profile: { display_name: null, email: "test@example.test", phone: null },
+  };
+  await client.syncUserProfile(snapshot);
+  await client.syncUserProfile(snapshot);
+  expect(sent).toEqual([
+    { path: "/v1/user-profiles", body: snapshot },
+    { path: "/v1/user-profiles", body: snapshot },
+  ]);
+});
+
+test("conflict errors retain exact whitelisted diagnostics without contact payloads", async () => {
+  const client = createBillingClient({
+    baseUrl: "https://billing.test",
+    apiKey: "synthetic",
+    fetch: (async () =>
+      Response.json(
+        {
+          code: "profile_revision_stale",
+          profile_revision: "9007199254740993",
+          profile_sync_generation: "g2",
+          request_id: "req_demo",
+          retryable: false,
+          profile: { email: "private@example.test" },
+          arbitrary: "omit",
+        },
+        { status: 409 },
+      )) as unknown as typeof fetch,
+  });
+  try {
+    await client.profileSync();
+    throw new Error("expected refusal");
+  } catch (error) {
+    expect(error).toMatchObject({
+      status: 409,
+      code: "profile_revision_stale",
+      profile_revision: "9007199254740993",
+      profile_sync_generation: "g2",
+      request_id: "req_demo",
+      retryable: false,
+    });
+    expect(JSON.stringify(error)).not.toContain("private@example.test");
+    expect(error).not.toHaveProperty("arbitrary");
+  }
+});
+
+test("malformed conflict diagnostics are not exposed as typed fields", async () => {
+  const client = createBillingClient({
+    baseUrl: "https://billing.test",
+    apiKey: "synthetic",
+    fetch: (async () =>
+      Response.json(
+        {
+          code: "profile_revision_stale",
+          profile_revision: 9007199254740992,
+          profile_sync_generation: { value: "g2" },
+          request_id: "bad\nvalue",
+          retryable: "false",
+        },
+        { status: 409 },
+      )) as unknown as typeof fetch,
+  });
+  try {
+    await client.profileSync();
+    throw new Error("expected refusal");
+  } catch (error) {
+    expect(error).toBeInstanceOf(BillingError);
+    expect(error).toMatchObject({
+      status: 409,
+      code: "profile_revision_stale",
+    });
+    for (const key of [
+      "profile_revision",
+      "profile_sync_generation",
+      "request_id",
+      "retryable",
+    ])
+      expect((error as any)[key]).toBeUndefined();
+  }
+});

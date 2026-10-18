@@ -230,6 +230,11 @@ export const createTestBilling = async (
     offer_version: `test-v${i + 1}`,
   }));
   const orders: TestOrder[] = [];
+  const profiles = new Map<
+    string,
+    { revision: string; profile: Record<string, unknown>; synced_at: string }
+  >();
+  const profileGeneration = `profilegen_${hex()}`;
   // Checkout refusals, durable per (customer, purchase_ref) as in the service:
   // a refused purchase_ref never creates an order.
   const refusals = new Map<string, string>();
@@ -452,6 +457,146 @@ export const createTestBilling = async (
       );
     const url = new URL(request.url);
     const parts = url.pathname.split("/").slice(1).map(decodeURIComponent);
+    if (request.method === "GET" && url.pathname === "/v1/profile-sync")
+      return {
+        status: 200,
+        body: { generation: profileGeneration, paused: false },
+      };
+    if (request.method === "POST" && url.pathname === "/v1/user-profiles") {
+      const v = await body(request);
+      fields(v, [
+        "user_id",
+        "profile_revision",
+        "profile_sync_generation",
+        "profile",
+      ]);
+      const user = id(v.user_id, "user");
+      if (
+        typeof v.profile_revision !== "string" ||
+        !/^[1-9][0-9]{0,18}$/.test(v.profile_revision) ||
+        BigInt(v.profile_revision) > 9223372036854775807n
+      )
+        invalid("invalid_integer", "invalid profile revision");
+      if (v.profile_sync_generation !== profileGeneration)
+        throw new Refusal(
+          409,
+          "profile_generation_conflict",
+          "profile generation changed",
+        );
+      if (
+        !v.profile ||
+        typeof v.profile !== "object" ||
+        Array.isArray(v.profile)
+      )
+        invalid("invalid_profile", "full profile required");
+      const p = v.profile as Record<string, unknown>;
+      fields(p, ["display_name", "email", "phone"]);
+      for (const k of ["display_name", "email", "phone"])
+        if (
+          p[k] !== null &&
+          (typeof p[k] !== "string" ||
+            !(p[k] as string).trim() ||
+            /[\u0000-\u001f\u007f]/.test(p[k] as string))
+        )
+          invalid("invalid_profile", "invalid profile field");
+      if (
+        (typeof p.display_name === "string" && p.display_name.length > 100) ||
+        (typeof p.email === "string" &&
+          (p.email.length > 254 ||
+            !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(p.email))) ||
+        (typeof p.phone === "string" && !/^\+[1-9][0-9]{6,14}$/.test(p.phone))
+      )
+        invalid("invalid_profile", "invalid profile field");
+      const profile = {
+        display_name:
+          typeof p.display_name === "string" ? p.display_name.trim() : null,
+        email:
+          typeof p.email === "string" ? p.email.trim().toLowerCase() : null,
+        phone: p.phone,
+      };
+      const old = profiles.get(user);
+      if (old && BigInt(v.profile_revision as string) < BigInt(old.revision))
+        throw new Refusal(409, "profile_revision_stale", "stale profile");
+      if (
+        old &&
+        old.revision === v.profile_revision &&
+        JSON.stringify(old.profile) !== JSON.stringify(profile)
+      )
+        throw new Refusal(
+          409,
+          "profile_revision_conflict",
+          "different profile",
+        );
+      const next =
+        old && old.revision === v.profile_revision
+          ? old
+          : {
+              revision: v.profile_revision as string,
+              profile,
+              synced_at: new Date(now()).toISOString(),
+            };
+      profiles.set(user, next);
+      return {
+        status: 200,
+        body: {
+          user_id: user,
+          profile_revision: next.revision,
+          profile_sync_generation: profileGeneration,
+          synced_at: next.synced_at,
+        },
+      };
+    }
+    if (
+      request.method === "GET" &&
+      url.pathname === "/v1/profile-sync/baseline"
+    ) {
+      let after = "";
+      const cursor = url.searchParams.get("cursor");
+      if (cursor) {
+        let c: unknown;
+        try {
+          c = JSON.parse(cursor);
+        } catch {
+          invalid("invalid_cursor", "bad cursor");
+        }
+        if (
+          !Array.isArray(c) ||
+          c.length !== 2 ||
+          c[0] !== profileGeneration ||
+          typeof c[1] !== "string"
+        )
+          invalid("invalid_cursor", "bad cursor");
+        after = (c as string[])[1]!;
+      }
+      const rows = [...new Set([...profiles.keys(), ...balances.keys()])]
+        .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+        .filter((u) => u > after)
+        .slice(0, 26);
+      const data = rows.slice(0, 25).map((user) => {
+        const p = profiles.get(user);
+        return {
+          user_id: user,
+          profile_revision: p?.revision ?? "0",
+          cleared: p
+            ? Object.values(p.profile).every((v) => v === null)
+            : false,
+        };
+      });
+      return {
+        status: 200,
+        body: {
+          generation: profileGeneration,
+          paused: false,
+          data,
+          has_more: rows.length > 25,
+          next_cursor:
+            rows.length > 25
+              ? JSON.stringify([profileGeneration, data.at(-1)!.user_id])
+              : null,
+        },
+      };
+    }
+
     if (request.method === "GET" && url.pathname === "/v1/catalog")
       return {
         status: 200,
